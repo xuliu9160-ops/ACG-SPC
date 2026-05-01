@@ -57,8 +57,8 @@ except Exception:
 # ==========================================================
 #  PATHS (server: BUV under /data/niyit/)
 # ==========================================================
-DATA_ROOT = "/data/niyit/Miccai 2022 BUV Dataset/rawframes"
-SAVE_DIR = "cross_val_results_last_epoch"
+DATA_ROOT = os.environ.get("VIDEO_ROOT", "/data/niyit/Miccai 2022 BUV Dataset/rawframes")
+SAVE_DIR = os.environ.get("SAVE_DIR", "cross_val_results_last_epoch")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 
@@ -84,7 +84,7 @@ ETA_MIN = 1e-6
 
 # Frame-branch static-image pretrain controls
 ENABLE_FRAME_BRANCH_PRETRAIN = True
-FRAME_BRANCH_PRETRAIN_CKPT = "frame_branch_pretrain_best.pth"
+FRAME_BRANCH_PRETRAIN_CKPT = os.environ.get("FRAME_BRANCH_PRETRAIN_CKPT", "frame_branch_pretrain_best.pth")
 FRAME_BRANCH_PRETRAIN_LOAD_BACKBONE = True
 FRAME_BRANCH_PRETRAIN_LOAD_FRAME_HEAD = True
 

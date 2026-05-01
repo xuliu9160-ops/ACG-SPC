@@ -8,3 +8,7 @@ env/
 *.log
 .ipynb_checkpoints/
 文件树与工作流程.txt
+
+*.pth
+*.pt
+cross_val_results*/
