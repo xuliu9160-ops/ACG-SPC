@@ -176,7 +176,20 @@ def create_qmil_backbone(backbone_source, timm_name, pretrained):
 
     if timm is None:
         raise ImportError("timm is not installed. Install with: pip install timm")
-    cnxt = timm.create_model(str(timm_name), pretrained=bool(pretrained), num_classes=0)
+    raw_timm_name = str(timm_name)
+    timm_name_aliases = {
+        "convnext_tiny.fb_in22k": "convnext_tiny_in22k",
+    }
+    resolved_timm_name = raw_timm_name
+    try:
+        cnxt = timm.create_model(resolved_timm_name, pretrained=bool(pretrained), num_classes=0)
+    except RuntimeError as e:
+        if "Unknown model" in str(e) and raw_timm_name in timm_name_aliases:
+            resolved_timm_name = timm_name_aliases[raw_timm_name]
+            print(f"[timm] Fallback model name: {raw_timm_name} -> {resolved_timm_name}")
+            cnxt = timm.create_model(resolved_timm_name, pretrained=bool(pretrained), num_classes=0)
+        else:
+            raise
     return _TimmConvNeXtStemStages(cnxt)
 
 
