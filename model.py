@@ -6,7 +6,12 @@
 
 import torch
 import torch.nn as nn
-from torchvision.models.convnext import convnext_tiny, ConvNeXt_Tiny_Weights
+try:
+    from torchvision.models.convnext import convnext_tiny, ConvNeXt_Tiny_Weights
+except Exception:
+    convnext_tiny = None
+    ConvNeXt_Tiny_Weights = None
+
 
 try:
     import timm
