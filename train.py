@@ -318,7 +318,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_video_ids, all_lab
     model = create_model()
     optimizer = create_optimizer(model)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=ETA_MIN)
-    scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     fold_dir = os.path.join(SAVE_DIR, f"fold{fold_idx}")
     os.makedirs(fold_dir, exist_ok=True)
@@ -337,7 +337,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_video_ids, all_lab
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 frame_logits, video_logits = model(videos)
                 loss, frame_loss_val, video_loss_val = combined_loss(
                     frame_logits, video_logits, labels,
