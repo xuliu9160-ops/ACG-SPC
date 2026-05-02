@@ -82,6 +82,13 @@ LR = 1e-4
 WEIGHT_DECAY = 1e-3
 ETA_MIN = 1e-6
 
+# Frame loss mode controls (default keeps baseline behavior)
+FRAME_LOSS_MODE = os.environ.get("FRAME_LOSS_MODE", "all_frame")
+MIL_SELECT_LEVEL = os.environ.get("MIL_SELECT_LEVEL", "segment")
+MIL_POS_TOPK_SEGMENTS = int(os.environ.get("MIL_POS_TOPK_SEGMENTS", "2"))
+MIL_MALIGNANT_CLASS_IDX = int(os.environ.get("MIL_MALIGNANT_CLASS_IDX", "1"))
+MIL_SELECTION_DETACH = os.environ.get("MIL_SELECTION_DETACH", "1") not in ["0", "false", "False"]
+
 # Frame-branch static-image pretrain controls
 ENABLE_FRAME_BRANCH_PRETRAIN = True
 FRAME_BRANCH_PRETRAIN_CKPT = os.environ.get("FRAME_BRANCH_PRETRAIN_CKPT", "frame_branch_pretrain_best.pth")
@@ -234,6 +241,14 @@ def predict_probs(model, loader):
 #  LOAD FULL INDEX
 # ==========================================================
 print("Loading full dataset index...")
+print(
+    "Frame loss config: "
+    f"mode={FRAME_LOSS_MODE}, "
+    f"mil_select_level={MIL_SELECT_LEVEL}, "
+    f"mil_pos_topk_segments={MIL_POS_TOPK_SEGMENTS}, "
+    f"mil_malignant_class_idx={MIL_MALIGNANT_CLASS_IDX}, "
+    f"mil_selection_detach={MIL_SELECTION_DETACH}"
+)
 full_dataset = BUVFolderDataset(
     root_dir=DATA_ROOT,
     segment_count=SEGMENTS,
@@ -344,6 +359,11 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_video_ids, all_lab
                     class_weights_frame=None,
                     class_weights_video=class_weights_video,
                     frame_weight=0.6,
+                    frame_loss_mode=FRAME_LOSS_MODE,
+                    mil_select_level=MIL_SELECT_LEVEL,
+                    mil_pos_topk_segments=MIL_POS_TOPK_SEGMENTS,
+                    mil_malignant_class_idx=MIL_MALIGNANT_CLASS_IDX,
+                    mil_selection_detach=MIL_SELECTION_DETACH,
                 )
 
             scaler.scale(loss).backward()
@@ -360,8 +380,8 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_video_ids, all_lab
             pbar.set_postfix(
                 loss=float(loss.item()),
                 acc=float(running_correct / max(1, running_total)),
-                frame=float(frame_loss_val),
-                video=float(video_loss_val),
+                frame=float(frame_loss_val.item()),
+                video=float(video_loss_val.item()),
                 lr=float(optimizer.param_groups[0]["lr"]),
             )
 
