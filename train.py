@@ -85,7 +85,7 @@ ETA_MIN = 1e-6
 # Frame loss mode controls (default keeps baseline behavior)
 FRAME_LOSS_MODE = os.environ.get("FRAME_LOSS_MODE", "all_frame")
 MIL_SELECT_LEVEL = os.environ.get("MIL_SELECT_LEVEL", "segment")
-MIL_POS_TOPK_SEGMENTS = int(os.environ.get("MIL_POS_TOPK_SEGMENTS", "2"))
+MIL_POS_TOPK_SEGMENTS = int(os.environ.get("MIL_POS_TOPK_SEGMENTS", "1"))
 MIL_MALIGNANT_CLASS_IDX = int(os.environ.get("MIL_MALIGNANT_CLASS_IDX", "1"))
 MIL_SELECTION_DETACH = os.environ.get("MIL_SELECTION_DETACH", "1") not in ["0", "false", "False"]
 
