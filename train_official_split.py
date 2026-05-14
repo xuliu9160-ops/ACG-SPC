@@ -83,7 +83,7 @@ SEGMENTS = 6
 FRAMES_PER_SEG = 3
 IMG_SIZE = 224
 
-EPOCHS = 50
+EPOCHS = int(os.environ.get("EPOCHS", "50"))
 BATCH_SIZE = 8
 NUM_WORKERS = 4
 PIN_MEMORY = torch.cuda.is_available()
