@@ -96,15 +96,20 @@ ETA_MIN = 1e-6
 N_REPEATS = int(os.environ.get("N_REPEATS", "5"))
 INTERNAL_VAL_RATIO = float(os.environ.get("INTERNAL_VAL_RATIO", "0.15"))
 
-# Frame loss mode controls (default keeps baseline behavior)
-FRAME_LOSS_MODE = os.environ.get("FRAME_LOSS_MODE", "all_frame")
+# Experiment identity
+EXPERIMENT_TAG = os.environ.get("EXPERIMENT_TAG", "buv_qmil_reverse_ablation")
+
+# Frame loss mode controls
+FRAME_LOSS_MODE = os.environ.get("FRAME_LOSS_MODE", "mil_selective")
 MIL_SELECT_LEVEL = os.environ.get("MIL_SELECT_LEVEL", "segment")
 MIL_POS_TOPK_SEGMENTS = int(os.environ.get("MIL_POS_TOPK_SEGMENTS", "1"))
 MIL_MALIGNANT_CLASS_IDX = int(os.environ.get("MIL_MALIGNANT_CLASS_IDX", "1"))
-MIL_SELECTION_DETACH = os.environ.get("MIL_SELECTION_DETACH", "1") not in ["0", "false", "False"]
+MIL_SELECTION_DETACH = os.environ.get("MIL_SELECTION_DETACH", "1").lower() not in ("0", "false", "no")
+
+FRAME_WEIGHT = float(os.environ.get("FRAME_WEIGHT", "0.6"))
 
 # Frame-branch static-image pretrain controls
-ENABLE_FRAME_BRANCH_PRETRAIN = True
+ENABLE_FRAME_BRANCH_PRETRAIN = os.environ.get("ENABLE_FRAME_BRANCH_PRETRAIN", "1").lower() in ("1", "true", "yes")
 FRAME_BRANCH_PRETRAIN_CKPT = os.environ.get("FRAME_BRANCH_PRETRAIN_CKPT", "frame_branch_pretrain_best.pth")
 FRAME_BRANCH_PRETRAIN_LOAD_BACKBONE = True
 FRAME_BRANCH_PRETRAIN_LOAD_FRAME_HEAD = True
@@ -294,7 +299,7 @@ def create_model():
         else:
             print(f"[FrameBranchPretrain] Checkpoint not found: {FRAME_BRANCH_PRETRAIN_CKPT}")
     else:
-        print("[FrameBranchPretrain] Disabled.")
+        print("[INFO] Frame branch pretrain disabled.")
 
     model = model.to(DEVICE)
 
@@ -338,19 +343,27 @@ def get_commit_hash():
 
 
 def main():
-    print("Official split protocol started.")
-    print(f"DATA_ROOT: {DATA_ROOT}")
-    print(f"OFFICIAL_TRAIN_JSON: {OFFICIAL_TRAIN_JSON}")
-    print(f"FIXED_TEST_JSON: {FIXED_TEST_JSON}")
-    print(f"SAVE_DIR: {SAVE_DIR}")
-    print(
-        "Frame loss config: "
-        f"mode={FRAME_LOSS_MODE}, "
-        f"mil_select_level={MIL_SELECT_LEVEL}, "
-        f"mil_pos_topk_segments={MIL_POS_TOPK_SEGMENTS}, "
-        f"mil_malignant_class_idx={MIL_MALIGNANT_CLASS_IDX}, "
-        f"mil_selection_detach={MIL_SELECTION_DETACH}"
-    )
+    print("=" * 80)
+    print("REVERSE ABLATION CONFIG")
+    print(f"EXPERIMENT_TAG:               {EXPERIMENT_TAG}")
+    print(f"ENABLE_FRAME_BRANCH_PRETRAIN: {ENABLE_FRAME_BRANCH_PRETRAIN}")
+    print(f"FRAME_BRANCH_PRETRAIN_CKPT:   {FRAME_BRANCH_PRETRAIN_CKPT}")
+    print(f"FRAME_LOSS_MODE:              {FRAME_LOSS_MODE}")
+    print(f"MIL_SELECT_LEVEL:             {MIL_SELECT_LEVEL}")
+    print(f"MIL_POS_TOPK_SEGMENTS:        {MIL_POS_TOPK_SEGMENTS}")
+    print(f"MIL_MALIGNANT_CLASS_IDX:      {MIL_MALIGNANT_CLASS_IDX}")
+    print(f"MIL_SELECTION_DETACH:         {MIL_SELECTION_DETACH}")
+    print(f"FRAME_WEIGHT:                 {FRAME_WEIGHT}")
+    print(f"QMIL selection_mode:          topk_softmax  topk=2")
+    print(f"VIDEO_ROOT:                   {DATA_ROOT}")
+    print(f"OFFICIAL_TRAIN_JSON:          {OFFICIAL_TRAIN_JSON}")
+    print(f"FIXED_TEST_JSON:              {FIXED_TEST_JSON}")
+    print(f"EPOCHS:                       {EPOCHS}")
+    print(f"BATCH_SIZE:                   {BATCH_SIZE}")
+    print(f"N_REPEATS:                    {N_REPEATS}")
+    print(f"SEED:                         {SEED}")
+    print(f"SAVE_DIR:                     {SAVE_DIR}")
+    print("=" * 80)
 
     train_entries = parse_official_json(OFFICIAL_TRAIN_JSON)
     fixed_test_entries = parse_official_json(FIXED_TEST_JSON)
@@ -503,7 +516,7 @@ def main():
                         labels,
                         class_weights_frame=None,
                         class_weights_video=class_weights_video,
-                        frame_weight=0.6,
+                        frame_weight=FRAME_WEIGHT,
                         frame_loss_mode=FRAME_LOSS_MODE,
                         mil_select_level=MIL_SELECT_LEVEL,
                         mil_pos_topk_segments=MIL_POS_TOPK_SEGMENTS,
@@ -680,16 +693,20 @@ def main():
             },
         },
         "config_snapshot": {
-            "repeat_count": int(N_REPEATS),
-            "train_internal_val_ratio": {"train": float(1.0 - INTERNAL_VAL_RATIO), "internal_val": float(INTERNAL_VAL_RATIO)},
+            "experiment_tag": EXPERIMENT_TAG,
+            "enable_frame_branch_pretrain": bool(ENABLE_FRAME_BRANCH_PRETRAIN),
+            "frame_branch_pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
+            "frame_loss_mode": FRAME_LOSS_MODE,
+            "mil_select_level": MIL_SELECT_LEVEL,
+            "mil_pos_topk_segments": int(MIL_POS_TOPK_SEGMENTS),
+            "mil_malignant_class_idx": int(MIL_MALIGNANT_CLASS_IDX),
+            "mil_selection_detach": bool(MIL_SELECTION_DETACH),
+            "frame_weight": FRAME_WEIGHT,
             "official_train_json_path": OFFICIAL_TRAIN_JSON,
             "fixed_test_json_path": FIXED_TEST_JSON,
             "video_root": DATA_ROOT,
-            "frame_loss_mode": FRAME_LOSS_MODE,
-            "mil_pos_topk_segments": int(MIL_POS_TOPK_SEGMENTS),
-            "mil_select_level": MIL_SELECT_LEVEL,
-            "mil_malignant_class_idx": int(MIL_MALIGNANT_CLASS_IDX),
-            "mil_selection_detach": bool(MIL_SELECTION_DETACH),
+            "repeat_count": int(N_REPEATS),
+            "train_internal_val_ratio": {"train": float(1.0 - INTERNAL_VAL_RATIO), "internal_val": float(INTERNAL_VAL_RATIO)},
             "seed": int(SEED),
             "commit_hash": get_commit_hash(),
         },
