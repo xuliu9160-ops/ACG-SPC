@@ -44,13 +44,23 @@ set_seed(SEED)
 #  DEVICE
 # ==========================================================
 GPU_IDS = [0]
-if GPU_IDS is not None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, GPU_IDS))
-    print(f"Set CUDA_VISIBLE_DEVICES to: {GPU_IDS}")
+
+EXTERNAL_CUDA = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+if EXTERNAL_CUDA:
+    print(f"[GPU] Respect external CUDA_VISIBLE_DEVICES={EXTERNAL_CUDA}")
+else:
+    gpu_ids_env = os.environ.get("GPU_IDS", "").strip()
+    if gpu_ids_env:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids_env
+        print(f"[GPU] Set CUDA_VISIBLE_DEVICES from GPU_IDS env: {gpu_ids_env}")
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, GPU_IDS))
+        print(f"[GPU] Set CUDA_VISIBLE_DEVICES from default GPU_IDS: {GPU_IDS}")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_MULTI_GPU = torch.cuda.device_count() > 1
-print(f"Device: {DEVICE} | GPUs visible: {torch.cuda.device_count()}")
+print(f"[GPU] CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+print(f"[GPU] DEVICE: {DEVICE} | GPUs visible: {torch.cuda.device_count()}")
 
 torch.backends.cudnn.benchmark = True
 try:
@@ -705,6 +715,8 @@ def main():
             "official_train_json_path": OFFICIAL_TRAIN_JSON,
             "fixed_test_json_path": FIXED_TEST_JSON,
             "video_root": DATA_ROOT,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "device": str(DEVICE),
             "repeat_count": int(N_REPEATS),
             "train_internal_val_ratio": {"train": float(1.0 - INTERNAL_VAL_RATIO), "internal_val": float(INTERNAL_VAL_RATIO)},
             "seed": int(SEED),
