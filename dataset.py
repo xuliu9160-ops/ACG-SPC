@@ -16,6 +16,7 @@
 #   train: (clip, label) where clip is [S, F, C, H, W]
 #   test : (clip, label) where clip is [S, F, C, H, W] with center sampling
 
+import json
 import os
 import random
 from typing import List, Tuple, Optional
@@ -249,6 +250,7 @@ class BUVImageDataset(Dataset):
       root_dir/
         benign/*.png|jpg|jpeg
         malignant/*.png|jpg|jpeg
+    Supports optional split_json to restrict images to specific videos.
     """
     def __init__(
         self,
@@ -258,6 +260,7 @@ class BUVImageDataset(Dataset):
         eval_resize: int = 256,
         rotation_angles: Tuple[int, ...] = (-15, -10, -5, 5, 10, 15),
         label_map: Optional[dict] = None,
+        split_json: Optional[str] = None,
         samples: Optional[List[Tuple[str, int]]] = None,
         verbose_errors: bool = False,
     ):
@@ -276,6 +279,14 @@ class BUVImageDataset(Dataset):
         self.mean = (0.485, 0.456, 0.406)
         self.std = (0.229, 0.224, 0.225)
 
+        # Resolve allowed (class_name, video_id) pairs from split_json
+        _allowed_pairs: Optional[set] = None
+        if split_json is not None and os.path.isfile(split_json):
+            _allowed_pairs = self._parse_split_json(split_json)
+        elif split_json is not None:
+            raise FileNotFoundError(f"split_json not found: {split_json}")
+        self._allowed_pairs = _allowed_pairs
+
         if samples is not None:
             self.samples = list(samples)
         else:
@@ -289,13 +300,44 @@ class BUVImageDataset(Dataset):
                 label = self.label_map[class_name.lower()]
                 # Recursively scan to support both flat and nested folder layouts.
                 for cur_dir, _, files in os.walk(class_dir):
+                    # Derive video_id: directory name relative to class_dir
+                    rel = os.path.relpath(cur_dir, class_dir)
+                    if rel == ".":
+                        video_id = "__flat__"
+                    else:
+                        video_id = rel.split(os.sep)[0]
+
+                    if self._allowed_pairs is not None:
+                        if (class_name, video_id) not in self._allowed_pairs:
+                            continue
+
                     for fn in sorted(files):
-                        if not fn.lower().endswith((".png", ".jpg", ".jpeg")):
+                        if not fn.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
                             continue
                         self.samples.append((os.path.join(cur_dir, fn), label))
 
         mode_name = "train" if self.train_mode else "eval"
         print(f"Loaded {len(self.samples)} static images for {mode_name} mode")
+
+    @staticmethod
+    def _parse_split_json(json_path: str) -> set:
+        """Parse {videos: [{name: "benign/vid_id"}, ...]} into a set of (class, video_id)."""
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "videos" not in data or not isinstance(data["videos"], list):
+            raise ValueError(f"Invalid split JSON schema in {json_path}: missing 'videos' list")
+
+        allowed = set()
+        for vid in data["videos"]:
+            full_name = str(vid.get("name", "")).strip()
+            if "/" not in full_name:
+                raise ValueError(f"Invalid video name '{full_name}' in {json_path}")
+            class_name, video_id = full_name.split("/", 1)
+            class_name = class_name.strip().lower()
+            video_id = video_id.strip()
+            allowed.add((class_name, video_id))
+        return allowed
 
     def __len__(self):
         return len(self.samples)

@@ -69,6 +69,8 @@ except Exception:
     pass
 
 
+DATASET_NAME = os.environ.get("DATASET_NAME", "BUV")
+
 # ==========================================================
 #  PATHS
 # ==========================================================
@@ -89,12 +91,12 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # ==========================================================
 #  CONFIG
 # ==========================================================
-SEGMENTS = 6
-FRAMES_PER_SEG = 3
+SEGMENTS = int(os.environ.get("SEGMENTS", "6"))
+FRAMES_PER_SEG = int(os.environ.get("FRAMES_PER_SEG", "3"))
 IMG_SIZE = 224
 
 EPOCHS = int(os.environ.get("EPOCHS", "50"))
-BATCH_SIZE = 8
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 NUM_WORKERS = 4
 PIN_MEMORY = torch.cuda.is_available()
 
@@ -365,9 +367,12 @@ def main():
     print(f"MIL_SELECTION_DETACH:         {MIL_SELECTION_DETACH}")
     print(f"FRAME_WEIGHT:                 {FRAME_WEIGHT}")
     print(f"QMIL selection_mode:          topk_softmax  topk=2")
+    print(f"DATASET_NAME:                 {DATASET_NAME}")
     print(f"VIDEO_ROOT:                   {DATA_ROOT}")
     print(f"OFFICIAL_TRAIN_JSON:          {OFFICIAL_TRAIN_JSON}")
     print(f"FIXED_TEST_JSON:              {FIXED_TEST_JSON}")
+    print(f"SEGMENTS:                     {SEGMENTS}")
+    print(f"FRAMES_PER_SEG:               {FRAMES_PER_SEG}")
     print(f"EPOCHS:                       {EPOCHS}")
     print(f"BATCH_SIZE:                   {BATCH_SIZE}")
     print(f"N_REPEATS:                    {N_REPEATS}")
@@ -704,6 +709,10 @@ def main():
         },
         "config_snapshot": {
             "experiment_tag": EXPERIMENT_TAG,
+            "dataset_name": DATASET_NAME,
+            "segments": int(SEGMENTS),
+            "frames_per_seg": int(FRAMES_PER_SEG),
+            "batch_size": int(BATCH_SIZE),
             "enable_frame_branch_pretrain": bool(ENABLE_FRAME_BRANCH_PRETRAIN),
             "frame_branch_pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
             "frame_loss_mode": FRAME_LOSS_MODE,

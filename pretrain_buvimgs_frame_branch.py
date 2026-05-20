@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import argparse
@@ -47,6 +48,26 @@ class ImageClassifier(nn.Module):
         return self.frame_head(feat)
 
 
+def make_grad_scaler(enabled: bool):
+    """AMP GradScaler — compatible with both old and new PyTorch."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=enabled)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def autocast_context(enabled: bool):
+    """AMP autocast context — compatible with both old and new PyTorch."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        try:
+            return torch.amp.autocast("cuda", enabled=enabled)
+        except TypeError:
+            return torch.amp.autocast(enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -92,7 +113,12 @@ def evaluate(model, loader, criterion, device):
 
 def main():
     parser = argparse.ArgumentParser("Pretrain frame branch with static images")
-    parser.add_argument("--data_root", type=str, default="busimage")
+    parser.add_argument("--data_root", type=str, required=True,
+                        help="Root dir with benign/ and malignant/ subdirs")
+    parser.add_argument("--train_split_json", type=str, default=None,
+                        help="JSON split file for train videos")
+    parser.add_argument("--val_split_json", type=str, default=None,
+                        help="JSON split file for val videos")
     parser.add_argument("--save_path", type=str, default="frame_branch_pretrain_best.pth")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -100,7 +126,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--img_size", type=int, default=224)
-    parser.add_argument("--val_ratio", type=float, default=0.2)
+    parser.add_argument("--val_ratio", type=float, default=0.2,
+                        help="Only used when --train_split_json/--val_split_json are NOT provided")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backbone_source", type=str, default="timm", choices=["torchvision", "timm"])
     parser.add_argument("--timm_name", type=str, default="convnext_tiny.fb_in22k")
@@ -116,43 +143,90 @@ def main():
     set_seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
-    all_dataset = BUVImageDataset(
-        root_dir=args.data_root,
-        img_size=args.img_size,
-        train_mode=True,
-    )
-    all_labels = np.array(all_dataset.get_labels(), dtype=np.int64)
-    all_samples = list(all_dataset.samples)
-    if len(all_samples) == 0:
-        raise RuntimeError(
-            f"No images found under {args.data_root}. "
-            "Expected class folders: benign/ and malignant/ (flat or nested)."
+    # ------------------------------------------------------------------
+    #  Build train / val datasets
+    # ------------------------------------------------------------------
+    if args.train_split_json is not None and args.val_split_json is not None:
+        # Use explicit split JSONs
+        print(f"[Split] Using train split: {args.train_split_json}")
+        print(f"[Split] Using val   split: {args.val_split_json}")
+        train_dataset = BUVImageDataset(
+            root_dir=args.data_root,
+            img_size=args.img_size,
+            train_mode=True,
+            split_json=args.train_split_json,
         )
-
-    idx = np.arange(len(all_samples))
-    train_idx, val_idx = train_test_split(
-        idx,
-        test_size=args.val_ratio,
-        random_state=args.seed,
-        shuffle=True,
-        stratify=all_labels if len(np.unique(all_labels)) > 1 else None,
-    )
-
-    train_samples = [all_samples[i] for i in train_idx]
-    val_samples = [all_samples[i] for i in val_idx]
-
-    train_dataset = BUVImageDataset(
-        root_dir=args.data_root,
-        img_size=args.img_size,
-        train_mode=True,
-        samples=train_samples,
-    )
-    val_dataset = BUVImageDataset(
-        root_dir=args.data_root,
-        img_size=args.img_size,
-        train_mode=False,
-        samples=val_samples,
-    )
+        val_dataset = BUVImageDataset(
+            root_dir=args.data_root,
+            img_size=args.img_size,
+            train_mode=False,
+            split_json=args.val_split_json,
+        )
+    elif args.train_split_json is not None:
+        print(f"[Split] Using train split: {args.train_split_json}")
+        print("[Split] WARNING: val_split_json not provided — using image-level random split from train pool")
+        all_dataset = BUVImageDataset(
+            root_dir=args.data_root,
+            img_size=args.img_size,
+            train_mode=True,
+            split_json=args.train_split_json,
+        )
+        all_labels = np.array(all_dataset.get_labels(), dtype=np.int64)
+        all_samples = list(all_dataset.samples)
+        if len(all_samples) == 0:
+            raise RuntimeError(f"No images found under {args.data_root} with train_split_json")
+        idx = np.arange(len(all_samples))
+        train_idx, val_idx = train_test_split(
+            idx, test_size=args.val_ratio, random_state=args.seed,
+            shuffle=True,
+            stratify=all_labels if len(np.unique(all_labels)) > 1 else None,
+        )
+        train_dataset = BUVImageDataset(
+            root_dir=args.data_root,
+            img_size=args.img_size,
+            train_mode=True,
+            samples=[all_samples[i] for i in train_idx],
+        )
+        val_dataset = BUVImageDataset(
+            root_dir=args.data_root,
+            img_size=args.img_size,
+            train_mode=False,
+            samples=[all_samples[i] for i in val_idx],
+        )
+    else:
+        print("[Split] WARNING: Neither train_split_json nor val_split_json provided. "
+              "Falling back to image-level random split from all images under data_root. "
+              "This may cause data leakage across videos.")
+        all_dataset = BUVImageDataset(
+            root_dir=args.data_root,
+            img_size=args.img_size,
+            train_mode=True,
+        )
+        all_labels = np.array(all_dataset.get_labels(), dtype=np.int64)
+        all_samples = list(all_dataset.samples)
+        if len(all_samples) == 0:
+            raise RuntimeError(
+                f"No images found under {args.data_root}. "
+                "Expected class folders: benign/ and malignant/ (flat or nested)."
+            )
+        idx = np.arange(len(all_samples))
+        train_idx, val_idx = train_test_split(
+            idx, test_size=args.val_ratio, random_state=args.seed,
+            shuffle=True,
+            stratify=all_labels if len(np.unique(all_labels)) > 1 else None,
+        )
+        train_dataset = BUVImageDataset(
+            root_dir=args.data_root,
+            img_size=args.img_size,
+            train_mode=True,
+            samples=[all_samples[i] for i in train_idx],
+        )
+        val_dataset = BUVImageDataset(
+            root_dir=args.data_root,
+            img_size=args.img_size,
+            train_mode=False,
+            samples=[all_samples[i] for i in val_idx],
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -171,6 +245,11 @@ def main():
         persistent_workers=(args.num_workers > 0),
     )
 
+    train_labels = np.array(train_dataset.get_labels(), dtype=np.int64)
+    print(f"Train images: {len(train_dataset)} | class dist: {np.bincount(train_labels, minlength=2)}")
+    val_labels = np.array(val_dataset.get_labels(), dtype=np.int64)
+    print(f"Val   images: {len(val_dataset)} | class dist: {np.bincount(val_labels, minlength=2)}")
+
     model = ImageClassifier(
         num_classes=2,
         backbone_source=args.backbone_source,
@@ -180,7 +259,7 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+    scaler = make_grad_scaler(enabled=torch.cuda.is_available())
 
     best_auc = -1.0
     best_epoch = -1
@@ -196,7 +275,7 @@ def main():
             labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+            with autocast_context(enabled=torch.cuda.is_available()):
                 logits = model(images)
                 loss = criterion(logits, labels)
 
@@ -230,8 +309,32 @@ def main():
         if val_auc > best_auc:
             best_auc = val_auc
             best_epoch = epoch
-            torch.save(model.state_dict(), save_path)
+            checkpoint = {
+                "state_dict": model.state_dict(),
+                "backbone_source": args.backbone_source,
+                "timm_name": args.timm_name,
+                "num_classes": 2,
+                "img_size": args.img_size,
+                "best_val_auc": float(best_auc),
+                "epoch": int(best_epoch),
+                "label_mapping": {"benign": 0, "malignant": 1},
+            }
+            torch.save(checkpoint, save_path)
             print(f"  -> Saved best checkpoint to: {save_path}")
+
+    # Save last checkpoint as well
+    last_path = save_path.replace(".pth", "_last.pth")
+    last_checkpoint = {
+        "state_dict": model.state_dict(),
+        "backbone_source": args.backbone_source,
+        "timm_name": args.timm_name,
+        "num_classes": 2,
+        "img_size": args.img_size,
+        "best_val_auc": float(best_auc),
+        "epoch": int(args.epochs),
+        "label_mapping": {"benign": 0, "malignant": 1},
+    }
+    torch.save(last_checkpoint, last_path)
 
     print(f"Finished. best_epoch={best_epoch}, best_val_auc={best_auc:.4f}, ckpt={save_path}")
 
