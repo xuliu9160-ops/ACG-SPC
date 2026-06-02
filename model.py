@@ -277,8 +277,60 @@ def create_qmil_frame_head(feature_dim, num_classes):
 
 
 # -----------------------------
-#  MAE checkpoint loader
+#  Key-compatible state_dict loader
 # -----------------------------
+def _load_state_dict_key_compatible(target, source_state_dict, module_name):
+    """
+    Load source_state_dict into target, handling torchvision/timm key prefix
+    differences in Sequential wrappers.
+
+    Attempt sequence:
+      1. strict=True direct load — works if both use same wrapper type.
+      2. Strip one "0." prefix level from source keys and retry strict=True.
+      3. Strip "features.0." prefix level and retry strict=True.
+      4. Raise RuntimeError with key samples on failure.
+    """
+    target_keys = set(target.state_dict().keys())
+    source_keys = set(source_state_dict.keys())
+
+    # Attempt 1: direct
+    if source_keys == target_keys:
+        target.load_state_dict(source_state_dict, strict=True)
+        return
+
+    # Attempt 2: strip single "0." prefix  (e.g. 0.0.weight -> 0.weight)
+    remapped = {}
+    for k, v in source_state_dict.items():
+        if k.startswith("0."):
+            remapped[k[2:]] = v
+        else:
+            remapped[k] = v
+    if set(remapped.keys()) == target_keys:
+        print(f"[MAE] {module_name}: remapped keys (stripped '0.' prefix) — strict load")
+        target.load_state_dict(remapped, strict=True)
+        return
+
+    # Attempt 3: strip "features.0." prefix
+    remapped2 = {}
+    prefix = "features.0."
+    for k, v in source_state_dict.items():
+        if k.startswith(prefix):
+            remapped2[k[len(prefix):]] = v
+        else:
+            remapped2[k] = v
+    if set(remapped2.keys()) == target_keys:
+        print(f"[MAE] {module_name}: remapped keys (stripped 'features.0.' prefix) — strict load")
+        target.load_state_dict(remapped2, strict=True)
+        return
+
+    # Failed — report
+    raise RuntimeError(
+        f"[MAE] Cannot load {module_name}: key mismatch after all remap attempts.\n"
+        f"  Target keys (sample): {sorted(target_keys)[:5]}\n"
+        f"  Source keys (sample): {sorted(source_keys)[:5]}"
+    )
+
+
 def load_convnext_encoder_from_mae_checkpoint(model, checkpoint_path):
     """
     Load ConvNeXt-Tiny encoder weights from a MAE pretrain checkpoint
@@ -340,8 +392,8 @@ def load_convnext_encoder_from_mae_checkpoint(model, checkpoint_path):
             f"[MAE] Wrapper feature_dim mismatch: {wrapper.feature_dim} vs model {model.feature_dim}"
         )
 
-    model.stem.load_state_dict(wrapper.stem.state_dict())
-    model.stages.load_state_dict(wrapper.stages.state_dict())
+    _load_state_dict_key_compatible(model.stem, wrapper.stem.state_dict(), "stem")
+    _load_state_dict_key_compatible(model.stages, wrapper.stages.state_dict(), "stages")
 
     print("[MAE] Encoder weights loaded successfully into VideoClassifier")
     print("[MAE] frame_head / quality_head / video_head are randomly initialized "
