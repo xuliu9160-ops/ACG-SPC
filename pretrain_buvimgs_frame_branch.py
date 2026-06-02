@@ -2,6 +2,8 @@ import json
 import os
 import random
 import argparse
+import subprocess
+from datetime import datetime, timezone
 
 import numpy as np
 import torch
@@ -19,6 +21,37 @@ from model import (
 )
 
 
+# -------------------------------------------------------
+#  Git info / param helpers
+# -------------------------------------------------------
+def get_git_info():
+    info = {"git_branch": "unknown", "git_commit": "unknown", "git_dirty": False}
+    try:
+        info["git_branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+        ).strip()
+    except Exception:
+        pass
+    try:
+        info["git_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+        info["git_dirty"] = bool(out.strip())
+    except Exception:
+        pass
+    return info
+
+
+def count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return int(total), int(trainable)
+
+
 class ImageClassifier(nn.Module):
     def __init__(
         self,
@@ -26,12 +59,14 @@ class ImageClassifier(nn.Module):
         backbone_source="timm",
         timm_name="convnext_tiny.fb_in22k",
         pretrained=True,
+        backbone_name="convnext_tiny",
     ):
         super().__init__()
         backbone = create_qmil_backbone(
             backbone_source=backbone_source,
             timm_name=timm_name,
             pretrained=pretrained,
+            backbone_name=backbone_name,
         )
         self.stem = backbone.stem
         self.stages = backbone.stages
@@ -133,6 +168,9 @@ def main():
     parser.add_argument("--timm_name", type=str, default="convnext_tiny.fb_in22k")
     parser.add_argument("--pretrained", action="store_true", default=True)
     parser.add_argument("--no_pretrained", dest="pretrained", action="store_false")
+    parser.add_argument("--backbone_name", type=str, default="convnext_tiny",
+                        choices=["convnext_tiny", "resnet18", "resnet34",
+                                 "efficientnet_b0", "mobilenet_v3_large"])
     parser.add_argument("--gpu_id", type=int, default=0)
     args = parser.parse_args()
 
@@ -255,7 +293,15 @@ def main():
         backbone_source=args.backbone_source,
         timm_name=args.timm_name,
         pretrained=args.pretrained,
+        backbone_name=args.backbone_name,
     ).to(device)
+    total_params, trainable_params = count_params(model)
+    print(
+        f"[Model] backbone={args.backbone_name}  "
+        f"feature_dim={model.feature_dim}  "
+        f"total_params={total_params:,}  "
+        f"trainable_params={trainable_params:,}"
+    )
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -309,32 +355,66 @@ def main():
         if val_auc > best_auc:
             best_auc = val_auc
             best_epoch = epoch
-            checkpoint = {
+            git_info = get_git_info()
+            ckpt_meta = {
                 "state_dict": model.state_dict(),
+                "backbone_name": args.backbone_name,
                 "backbone_source": args.backbone_source,
                 "timm_name": args.timm_name,
+                "feature_dim": int(model.feature_dim),
+                "total_params": int(total_params),
+                "trainable_params": int(trainable_params),
+                "pretrain_type": "supervised_frame_branch",
                 "num_classes": 2,
                 "img_size": args.img_size,
                 "best_val_auc": float(best_auc),
                 "epoch": int(best_epoch),
                 "label_mapping": {"benign": 0, "malignant": 1},
+                "data_source": str(args.data_root),
+                "train_split_json": args.train_split_json,
+                "val_split_json": args.val_split_json,
+                "seed": int(args.seed),
+                "batch_size": int(args.batch_size),
+                "epochs": int(args.epochs),
+                "lr": float(args.lr),
+                "git_branch": git_info["git_branch"],
+                "git_commit": git_info["git_commit"],
+                "git_dirty": git_info["git_dirty"],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            torch.save(checkpoint, save_path)
+            torch.save(ckpt_meta, save_path)
             print(f"  -> Saved best checkpoint to: {save_path}")
 
     # Save last checkpoint as well
     last_path = save_path.replace(".pth", "_last.pth")
-    last_checkpoint = {
+    git_info_last = get_git_info()
+    last_ckpt = {
         "state_dict": model.state_dict(),
+        "backbone_name": args.backbone_name,
         "backbone_source": args.backbone_source,
         "timm_name": args.timm_name,
+        "feature_dim": int(model.feature_dim),
+        "total_params": int(total_params),
+        "trainable_params": int(trainable_params),
+        "pretrain_type": "supervised_frame_branch",
         "num_classes": 2,
         "img_size": args.img_size,
         "best_val_auc": float(best_auc),
         "epoch": int(args.epochs),
         "label_mapping": {"benign": 0, "malignant": 1},
+        "data_source": str(args.data_root),
+        "train_split_json": args.train_split_json,
+        "val_split_json": args.val_split_json,
+        "seed": int(args.seed),
+        "batch_size": int(args.batch_size),
+        "epochs": int(args.epochs),
+        "lr": float(args.lr),
+        "git_branch": git_info_last["git_branch"],
+        "git_commit": git_info_last["git_commit"],
+        "git_dirty": git_info_last["git_dirty"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    torch.save(last_checkpoint, last_path)
+    torch.save(last_ckpt, last_path)
 
     print(f"Finished. best_epoch={best_epoch}, best_val_auc={best_auc:.4f}, ckpt={save_path}")
 

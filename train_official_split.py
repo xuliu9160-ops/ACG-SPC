@@ -3,6 +3,7 @@ import os
 import random
 import subprocess
 from collections import Counter
+from datetime import datetime, timezone
 
 import numpy as np
 import torch
@@ -126,6 +127,9 @@ FRAME_BRANCH_PRETRAIN_CKPT = os.environ.get("FRAME_BRANCH_PRETRAIN_CKPT", "frame
 FRAME_BRANCH_PRETRAIN_LOAD_BACKBONE = True
 FRAME_BRANCH_PRETRAIN_LOAD_FRAME_HEAD = True
 
+# Backbone selection
+BACKBONE_NAME = os.environ.get("BACKBONE_NAME", "convnext_tiny")
+
 
 # ==========================================================
 #  METRICS
@@ -181,6 +185,37 @@ def youden_threshold(probs, y):
 
 def _get_base_model(model):
     return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+# -------------------------------------------------------
+#  Git info / param count helpers
+# -------------------------------------------------------
+def _get_git_info():
+    info = {"git_branch": "unknown", "git_commit": "unknown", "git_dirty": False}
+    try:
+        info["git_branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+        ).strip()
+    except Exception:
+        pass
+    try:
+        info["git_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+        info["git_dirty"] = bool(out.strip())
+    except Exception:
+        pass
+    return info
+
+
+def _count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return int(total), int(trainable)
 
 
 # ==========================================================
@@ -245,6 +280,8 @@ def class_counter_from_entries(entries):
 # ==========================================================
 #  MODEL / OPTIM
 # ==========================================================
+_MODEL_META = {}  # populated by create_model() for snapshot/manifest use
+
 def create_model():
     model = VideoClassifier(
         num_classes=2,
@@ -253,20 +290,62 @@ def create_model():
         backbone_source="timm",
         timm_name="convnext_tiny.fb_in22k",
         pretrained=True,
+        backbone_name=BACKBONE_NAME,
         selection_mode="topk_softmax",
         topk=2,
         video_dropout=0.5,
     )
+    total_params, trainable_params = _count_params(model)
+    print(
+        f"[Model] backbone={BACKBONE_NAME}  "
+        f"feature_dim={model.feature_dim}  "
+        f"total_params={total_params:,}  "
+        f"trainable_params={trainable_params:,}"
+    )
 
     if ENABLE_FRAME_BRANCH_PRETRAIN:
         if os.path.isfile(FRAME_BRANCH_PRETRAIN_CKPT):
-            ckpt = torch.load(FRAME_BRANCH_PRETRAIN_CKPT, map_location="cpu")
-            if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                ckpt = ckpt["state_dict"]
+            raw_ckpt = torch.load(FRAME_BRANCH_PRETRAIN_CKPT, map_location="cpu")
+
+            # --- backbone_name guard ---
+            ckpt_backbone = None
+            ckpt_feature_dim = None
+            if isinstance(raw_ckpt, dict):
+                ckpt_backbone = raw_ckpt.get("backbone_name", None)
+                ckpt_feature_dim = raw_ckpt.get("feature_dim", None)
+
+            if isinstance(raw_ckpt, dict) and "state_dict" in raw_ckpt:
+                ckpt = raw_ckpt["state_dict"]
+            else:
+                ckpt = raw_ckpt
 
             if not isinstance(ckpt, dict):
                 print(f"[FrameBranchPretrain] Invalid checkpoint format: {FRAME_BRANCH_PRETRAIN_CKPT}")
             else:
+                # backbone_name check
+                if ckpt_backbone is not None and ckpt_backbone != BACKBONE_NAME:
+                    raise ValueError(
+                        f"[FrameBranchPretrain] BACKBONE MISMATCH: "
+                        f"checkpoint backbone='{ckpt_backbone}' vs current BACKBONE_NAME='{BACKBONE_NAME}'. "
+                        f"Cannot load {ckpt_backbone} pretrain weights into {BACKBONE_NAME} model. "
+                        f"Checkpoint: {FRAME_BRANCH_PRETRAIN_CKPT}"
+                    )
+                elif ckpt_backbone is None:
+                    print(
+                        "[FrameBranchPretrain] WARNING: checkpoint has no backbone_name metadata. "
+                        "Cannot verify backbone match — proceed at your own risk."
+                    )
+                else:
+                    print(f"[FrameBranchPretrain] Backbone match confirmed: {ckpt_backbone}")
+
+                # feature_dim check
+                if ckpt_feature_dim is not None and int(ckpt_feature_dim) != model.feature_dim:
+                    raise ValueError(
+                        f"[FrameBranchPretrain] FEATURE_DIM MISMATCH: "
+                        f"checkpoint feature_dim={ckpt_feature_dim} vs model feature_dim={model.feature_dim}. "
+                        f"Checkpoint: {FRAME_BRANCH_PRETRAIN_CKPT}"
+                    )
+
                 normalized = {}
                 for k, v in ckpt.items():
                     nk = k[7:] if k.startswith("module.") else k
@@ -284,6 +363,13 @@ def create_model():
                             f"missing={len(load_info.missing_keys)} | "
                             f"unexpected={len(load_info.unexpected_keys)}"
                         )
+                        if len(load_info.missing_keys) > 20 or len(load_info.unexpected_keys) > 20:
+                            print(
+                                "[FrameBranchPretrain] WARNING: large mismatch in backbone load — "
+                                "possible backbone/structure mismatch. "
+                                f"missing_keys sample: {load_info.missing_keys[:5]}  "
+                                f"unexpected_keys sample: {load_info.unexpected_keys[:5]}"
+                            )
                     else:
                         print("[FrameBranchPretrain] Backbone load: SKIPPED (no stem/stages keys in ckpt)")
                 else:
@@ -318,6 +404,18 @@ def create_model():
     if USE_MULTI_GPU:
         model = torch.nn.DataParallel(model)
         print(f"Model wrapped with DataParallel (using {torch.cuda.device_count()} GPUs)")
+
+    # attach metadata for manifest
+    model._qm_backbone_name = BACKBONE_NAME
+    model._qm_total_params = total_params
+    model._qm_trainable_params = trainable_params
+    # store globally for config_snapshot / manifest / result_summary
+    _MODEL_META.update({
+        "backbone_name": BACKBONE_NAME,
+        "feature_dim": int(model.feature_dim),
+        "total_params": int(total_params),
+        "trainable_params": int(trainable_params),
+    })
     return model
 
 
@@ -348,16 +446,16 @@ def ms(x):
 
 
 def get_commit_hash():
-    try:
-        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
-    except Exception:
-        return None
+    """Legacy wrapper — kept for backward compat."""
+    info = _get_git_info()
+    return info["git_commit"][:8] if info["git_commit"] != "unknown" else None
 
 
 def main():
     print("=" * 80)
     print("REVERSE ABLATION CONFIG")
     print(f"EXPERIMENT_TAG:               {EXPERIMENT_TAG}")
+    print(f"BACKBONE_NAME:                {BACKBONE_NAME}")
     print(f"ENABLE_FRAME_BRANCH_PRETRAIN: {ENABLE_FRAME_BRANCH_PRETRAIN}")
     print(f"FRAME_BRANCH_PRETRAIN_CKPT:   {FRAME_BRANCH_PRETRAIN_CKPT}")
     print(f"FRAME_LOSS_MODE:              {FRAME_LOSS_MODE}")
@@ -689,6 +787,8 @@ def main():
     sp_vy_m, sp_vy_s = ms(vals_sp_vy)
     ac_vy_m, ac_vy_s = ms(vals_ac_vy)
 
+    git_info = _get_git_info()
+
     summary_payload = {
         "repeat_results": repeat_results,
         "fixed_test_summary": {
@@ -709,6 +809,10 @@ def main():
         },
         "config_snapshot": {
             "experiment_tag": EXPERIMENT_TAG,
+            "backbone_name": BACKBONE_NAME,
+            "feature_dim": int(_MODEL_META.get("feature_dim", -1)),
+            "total_params": int(_MODEL_META.get("total_params", -1)),
+            "trainable_params": int(_MODEL_META.get("trainable_params", -1)),
             "dataset_name": DATASET_NAME,
             "segments": int(SEGMENTS),
             "frames_per_seg": int(FRAMES_PER_SEG),
@@ -721,6 +825,7 @@ def main():
             "mil_malignant_class_idx": int(MIL_MALIGNANT_CLASS_IDX),
             "mil_selection_detach": bool(MIL_SELECTION_DETACH),
             "frame_weight": FRAME_WEIGHT,
+            "qmil_topk": 2,
             "official_train_json_path": OFFICIAL_TRAIN_JSON,
             "fixed_test_json_path": FIXED_TEST_JSON,
             "video_root": DATA_ROOT,
@@ -729,7 +834,10 @@ def main():
             "repeat_count": int(N_REPEATS),
             "train_internal_val_ratio": {"train": float(1.0 - INTERNAL_VAL_RATIO), "internal_val": float(INTERNAL_VAL_RATIO)},
             "seed": int(SEED),
-            "commit_hash": get_commit_hash(),
+            "commit_hash": git_info["git_commit"],
+            "git_branch": git_info["git_branch"],
+            "git_dirty": git_info["git_dirty"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         },
     }
 
@@ -737,8 +845,95 @@ def main():
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary_payload, f, indent=2)
 
+    # --- experiment_manifest.json ---
+    manifest = {
+        "experiment_tag": EXPERIMENT_TAG,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "git_branch": git_info["git_branch"],
+        "git_commit": git_info["git_commit"],
+        "git_dirty": git_info["git_dirty"],
+        "seed": int(SEED),
+        "dataset_name": DATASET_NAME,
+        "backbone_name": BACKBONE_NAME,
+        "feature_dim": int(_MODEL_META.get("feature_dim", -1)),
+        "total_params": int(_MODEL_META.get("total_params", -1)),
+        "trainable_params": int(_MODEL_META.get("trainable_params", -1)),
+        "batch_size": BATCH_SIZE,
+        "segments": SEGMENTS,
+        "frames_per_seg": FRAMES_PER_SEG,
+        "epochs": EPOCHS,
+        "lr": LR,
+        "weight_decay": WEIGHT_DECAY,
+        "frame_weight": FRAME_WEIGHT,
+        "qmil_topk": 2,
+        "mil_pos_topk_segments": int(MIL_POS_TOPK_SEGMENTS),
+        "mil_select_level": MIL_SELECT_LEVEL,
+        "mil_selection_detach": bool(MIL_SELECTION_DETACH),
+        "frame_loss_mode": FRAME_LOSS_MODE,
+        "enable_frame_branch_pretrain": bool(ENABLE_FRAME_BRANCH_PRETRAIN),
+        "frame_branch_pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
+        "official_train_json_path": OFFICIAL_TRAIN_JSON,
+        "fixed_test_json_path": FIXED_TEST_JSON,
+        "video_root": DATA_ROOT,
+        "output_dir": SAVE_DIR,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "device": str(DEVICE),
+        "repeat_count": int(N_REPEATS),
+        "internal_val_ratio": float(INTERNAL_VAL_RATIO),
+        "n_repeats": int(N_REPEATS),
+    }
+    manifest_path = os.path.join(SAVE_DIR, "experiment_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    # --- result_summary.json ---
+    result_summary = {
+        "experiment_tag": EXPERIMENT_TAG,
+        "backbone_name": BACKBONE_NAME,
+        "feature_dim": int(_MODEL_META.get("feature_dim", -1)),
+        "total_params": int(_MODEL_META.get("total_params", -1)),
+        "trainable_params": int(_MODEL_META.get("trainable_params", -1)),
+        "pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
+        "n_repeats": int(N_REPEATS),
+        "fixed_test_summary": {
+            "auc": {"mean": auc_m, "std": auc_s},
+            "auprc": {"mean": auprc_m, "std": auprc_s},
+            "metrics@0.5": {
+                "f1": {"mean": f1_05_m, "std": f1_05_s},
+                "sensitivity": {"mean": se_05_m, "std": se_05_s},
+                "specificity": {"mean": sp_05_m, "std": sp_05_s},
+                "accuracy": {"mean": ac_05_m, "std": ac_05_s},
+            },
+            "metrics@val_youden_on_test": {
+                "f1": {"mean": f1_vy_m, "std": f1_vy_s},
+                "sensitivity": {"mean": se_vy_m, "std": se_vy_s},
+                "specificity": {"mean": sp_vy_m, "std": sp_vy_s},
+                "accuracy": {"mean": ac_vy_m, "std": ac_vy_s},
+            },
+        },
+        "per_repeat": [
+            {
+                "repeat": r["repeat"],
+                "split_seed": r["split_seed"],
+                "best_epoch": r["best_val_result"]["best_epoch"],
+                "best_val_auc": r["best_val_result"]["best_val_auc"],
+                "best_val_auprc": r["best_val_result"]["best_val_auprc"],
+                "youden_threshold": r["best_val_result"]["youden_threshold_on_internal_val"],
+                "fixed_test_auc": r["fixed_test_result_best"]["fixed_test_auc"],
+                "fixed_test_auprc": r["fixed_test_result_best"]["fixed_test_auprc"],
+            }
+            for r in repeat_results
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "git_commit": git_info["git_commit"],
+    }
+    result_summary_path = os.path.join(SAVE_DIR, "result_summary.json")
+    with open(result_summary_path, "w", encoding="utf-8") as f:
+        json.dump(result_summary, f, indent=2)
+
     print("\n" + "=" * 100)
     print("OFFICIAL SPLIT SUMMARY (FIXED TEST, BEST INTERNAL-VAL AUC CHECKPOINT)")
+    print(f"Backbone: {BACKBONE_NAME}")
     print(f"AUC   : {auc_m*100:.2f} ± {auc_s*100:.2f}%")
     print(f"AUPRC : {auprc_m*100:.2f} ± {auprc_s*100:.2f}%")
     print("Metrics@0.5")
@@ -753,7 +948,9 @@ def main():
     print(f"Accuracy   : {ac_vy_m*100:.2f} ± {ac_vy_s*100:.2f}%")
     print("=" * 100)
     print(f"Saved all outputs to: {SAVE_DIR}")
-    print(f"Summary JSON: {summary_path}")
+    print(f"Summary JSON:      {summary_path}")
+    print(f"Manifest JSON:     {manifest_path}")
+    print(f"Result Summary:    {result_summary_path}")
 
 
 if __name__ == "__main__":

@@ -95,6 +95,9 @@ FRAME_BRANCH_PRETRAIN_CKPT = os.environ.get("FRAME_BRANCH_PRETRAIN_CKPT", "frame
 FRAME_BRANCH_PRETRAIN_LOAD_BACKBONE = True
 FRAME_BRANCH_PRETRAIN_LOAD_FRAME_HEAD = True
 
+# Backbone selection
+BACKBONE_NAME = os.environ.get("BACKBONE_NAME", "convnext_tiny")
+
 
 # ==========================================================
 #  METRICS
@@ -146,6 +149,7 @@ def create_model():
         backbone_source="timm",
         timm_name="convnext_tiny.fb_in22k",
         pretrained=True,
+        backbone_name=BACKBONE_NAME,
         selection_mode="topk_softmax",
         topk=2,
         video_dropout=0.5,

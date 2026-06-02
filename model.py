@@ -164,7 +164,80 @@ class _TorchvisionConvNeXtStemStages(nn.Module):
         self.feature_dim = int(model.classifier[2].in_features)
 
 
-def create_qmil_backbone(backbone_source, timm_name, pretrained):
+# -----------------------------
+#  Generic 2D backbone wrappers
+# -----------------------------
+class _ResNetStemStages(nn.Module):
+    """Wrap torchvision ResNet (18/34) into stem + stages.  feature_dim=512."""
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.stem = nn.Sequential(
+            model.conv1, model.bn1, model.relu, model.maxpool,
+        )
+        self.stages = nn.Sequential(
+            model.layer1, model.layer2, model.layer3, model.layer4,
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.feature_dim = 512
+
+
+class _EfficientNetStemStages(nn.Module):
+    """Wrap torchvision EfficientNet-B0 into stem + stages.  feature_dim=1280."""
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        feats = list(model.features)
+        self.stem = nn.Sequential(feats[0], feats[1])
+        self.stages = nn.Sequential(
+            *feats[2:],
+            model.avgpool if hasattr(model, "avgpool") else nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        # classifier is [Dropout(p), Linear(1280, nc)]
+        self.feature_dim = int(model.classifier[1].in_features)
+
+
+class _MobileNetV3StemStages(nn.Module):
+    """Wrap torchvision MobileNetV3-Large into stem + stages.  feature_dim=960."""
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        feats = list(model.features)
+        self.stem = nn.Sequential(feats[0], feats[1])
+        self.stages = nn.Sequential(
+            *feats[2:],
+            model.avgpool if hasattr(model, "avgpool") else nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        # classifier is [Linear(960,1280), Hardswish, Dropout, Linear(1280,nc)]
+        self.feature_dim = int(model.classifier[0].in_features)
+
+
+def create_qmil_backbone(backbone_source, timm_name, pretrained, backbone_name="convnext_tiny"):
+    backbone_name = str(backbone_name).lower()
+
+    # --- 2D backbone dispatch (non-ConvNeXt) ---
+    if backbone_name == "resnet18":
+        from torchvision.models import resnet18, ResNet18_Weights
+        w = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        return _ResNetStemStages(resnet18(weights=w))
+
+    if backbone_name == "resnet34":
+        from torchvision.models import resnet34, ResNet34_Weights
+        w = ResNet34_Weights.IMAGENET1K_V1 if pretrained else None
+        return _ResNetStemStages(resnet34(weights=w))
+
+    if backbone_name == "efficientnet_b0":
+        from torchvision.models import efficientnet_b0
+        try:
+            from torchvision.models import EfficientNet_B0_Weights
+            w = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        except ImportError:
+            w = pretrained  # older torchvision: pretrained is bool
+        return _EfficientNetStemStages(efficientnet_b0(weights=w) if w is not None else efficientnet_b0())
+
+    if backbone_name == "mobilenet_v3_large":
+        from torchvision.models import mobilenet_v3_large, MobileNet_V3_Large_Weights
+        w = MobileNet_V3_Large_Weights.IMAGENET1K_V1 if pretrained else None
+        return _MobileNetV3StemStages(mobilenet_v3_large(weights=w))
+
+    # --- ConvNeXt-Tiny branch (existing, default) ---
     backbone_source = str(backbone_source).lower()
     if backbone_source not in ("torchvision", "timm"):
         raise ValueError("backbone_source must be 'torchvision' or 'timm'")
@@ -216,6 +289,7 @@ class VideoClassifier(nn.Module):
         backbone_source: str = "torchvision",   # "torchvision" or "timm"
         timm_name: str = "convnext_tiny.fb_in22k",
         pretrained: bool = True,
+        backbone_name: str = "convnext_tiny",    # see create_qmil_backbone
         selection_mode: str = "topk_softmax",
         topk: int = 2,
     ):
@@ -229,6 +303,7 @@ class VideoClassifier(nn.Module):
             backbone_source=backbone_source,
             timm_name=timm_name,
             pretrained=pretrained,
+            backbone_name=backbone_name,
         )
         self.stem = backbone.stem
         self.stages = backbone.stages
