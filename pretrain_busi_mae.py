@@ -76,6 +76,11 @@ def main():
     parser.add_argument("--pretrained", action="store_true", default=True,
                         help="Init encoder from ImageNet pretrained weights")
     parser.add_argument("--no_pretrained", dest="pretrained", action="store_false")
+    parser.add_argument("--backbone_source", type=str, default="timm",
+                        choices=["timm", "torchvision"])
+    parser.add_argument("--timm_name", type=str, default="convnext_tiny.fb_in22k")
+    parser.add_argument("--backbone_name", type=str, default="convnext_tiny",
+                        choices=["convnext_tiny"])
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
@@ -109,13 +114,17 @@ def main():
     #  Model
     # ---------------------------------------------------------------
     model = ConvNeXtMAE(
+        backbone_source=args.backbone_source,
+        timm_name=args.timm_name,
+        backbone_name=args.backbone_name,
         img_size=args.img_size,
         patch_size=args.patch_size,
         mask_ratio=args.mask_ratio,
         pretrained=args.pretrained,
     ).to(device)
     params = model.count_params()
-    print(f"[MAE] Backbone: convnext_tiny  feature_dim={model.feature_dim}")
+    print(f"[MAE] Backbone: {args.backbone_name}  source={args.backbone_source}  "
+          f"timm_name={args.timm_name}  feature_dim={model.feature_dim}")
     print(f"[MAE] Params — total={params['total']:,}  encoder={params['encoder']:,}  "
           f"decoder={params['decoder']:,}  trainable={params['trainable']:,}")
     print(f"[MAE] mask_ratio={args.mask_ratio}  patch_size={args.patch_size}  "
@@ -201,10 +210,16 @@ def _save_checkpoint(model, params, args, path, best_loss, best_epoch,
     git_info = get_git_info()
     ckpt = {
         "pretrain_type": "mae",
-        "backbone_name": "convnext_tiny",
+        "backbone_name": args.backbone_name,
+        "backbone_source": args.backbone_source,
+        "timm_name": args.timm_name if args.backbone_source == "timm" else None,
         "feature_dim": model.feature_dim,
-        "encoder_state_dict": model.encoder.state_dict(),
+        # Primary: stem/stages state_dict (for strict-load into downstream VideoClassifier)
+        "stem_state_dict": model.stem.state_dict(),
+        "stages_state_dict": model.stages.state_dict(),
         "decoder_state_dict": model.decoder.state_dict(),
+        # Legacy: also save encoder_state_dict for torchvision fallback compatibility
+        "encoder_state_dict": model.stem.state_dict() if hasattr(model, "encoder") else None,
         "mask_ratio": args.mask_ratio,
         "patch_size": args.patch_size,
         "img_size": args.img_size,

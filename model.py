@@ -333,19 +333,17 @@ def _load_state_dict_key_compatible(target, source_state_dict, module_name):
 
 def load_convnext_encoder_from_mae_checkpoint(model, checkpoint_path):
     """
-    Load ConvNeXt-Tiny encoder weights from a MAE pretrain checkpoint
-    into a VideoClassifier model.
+    Load ConvNeXt-Tiny MAE encoder weights into a VideoClassifier model.
 
-    The MAE checkpoint must contain:
-      - pretrain_type == "mae"
-      - backbone_name == "convnext_tiny"
-      - feature_dim matching model.feature_dim
-      - encoder_state_dict (keys from torchvision convnext_tiny().features)
+    Primary path (timm MAE → timm downstream):
+      Uses stem_state_dict + stages_state_dict with strict=True.
+      Same backbone_source/timm_name guarantees perfect key match.
+
+    Torchvision MAE → timm downstream:
+      REJECTED — raises ValueError asking to re-train with backbone_source=timm.
 
     Does NOT load frame_head / quality_head / video_head.
     """
-    from torchvision.models.convnext import convnext_tiny
-
     raw_ckpt = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(raw_ckpt, dict):
         raise ValueError(f"[MAE] Invalid checkpoint format: {checkpoint_path}")
@@ -371,47 +369,54 @@ def load_convnext_encoder_from_mae_checkpoint(model, checkpoint_path):
             f"Checkpoint: {checkpoint_path}"
         )
 
-    encoder_sd = raw_ckpt.get("encoder_state_dict", None)
-    if encoder_sd is None:
+    ckpt_source = raw_ckpt.get("backbone_source", None)
+
+    # --- Primary path: timm MAE → timm downstream ---
+    if ckpt_source == "timm":
+        stem_sd = raw_ckpt.get("stem_state_dict", None)
+        stages_sd = raw_ckpt.get("stages_state_dict", None)
+        if stem_sd is None or stages_sd is None:
+            raise ValueError(
+                "[MAE] timm checkpoint missing 'stem_state_dict'/'stages_state_dict'. "
+                "Re-train MAE with backbone_source=timm."
+            )
+
+        model.stem.load_state_dict(stem_sd, strict=True)
+        model.stages.load_state_dict(stages_sd, strict=True)
+        print("[MAE] Loaded timm stem/stages from MAE checkpoint with strict=True")
+        print("[MAE] frame_head / quality_head / video_head are randomly initialized "
+              "(not loaded from MAE checkpoint)")
+
+        return {
+            "pretrain_type": "mae",
+            "backbone_name": "convnext_tiny",
+            "backbone_source": "timm",
+            "timm_name": raw_ckpt.get("timm_name", None),
+            "feature_dim": model.feature_dim,
+            "mask_ratio": raw_ckpt.get("mask_ratio", None),
+            "patch_size": raw_ckpt.get("patch_size", None),
+            "mae_best_loss": raw_ckpt.get("best_loss", None),
+            "mae_best_epoch": raw_ckpt.get("best_epoch", None),
+            "mae_epochs": raw_ckpt.get("epochs", None),
+            "encoder_params": raw_ckpt.get("encoder_params", None),
+            "decoder_params": raw_ckpt.get("decoder_params", None),
+        }
+
+    # --- Torchvision MAE → timm downstream: REJECT ---
+    if ckpt_source == "torchvision" or ckpt_source is None:
+        src_label = ckpt_source if ckpt_source else "unknown"
         raise ValueError(
-            f"[MAE] Checkpoint missing 'encoder_state_dict'. "
-            f"Checkpoint: {checkpoint_path}"
+            "[MAE] Torchvision MAE checkpoint is NOT compatible with timm downstream. "
+            "The downstream VideoClassifier uses backbone_source='timm', but the MAE checkpoint "
+            f"was trained with backbone_source='{src_label}'. "
+            "Please re-run BUSI-MAE pretraining with --backbone_source timm "
+            "--timm_name convnext_tiny.fb_in22k to generate a compatible checkpoint."
         )
 
-    # Load encoder into raw convnext_tiny, then re-wrap with existing logic
-    raw_cnxt = convnext_tiny(weights=None)
-    load_info = raw_cnxt.features.load_state_dict(encoder_sd, strict=True)
-    print(
-        "[MAE] Encoder loaded into raw convnext_tiny.features "
-        f"(missing={len(load_info.missing_keys)}, unexpected={len(load_info.unexpected_keys)})"
+    raise ValueError(
+        f"[MAE] Unknown backbone_source='{ckpt_source}' in checkpoint. "
+        f"Expected 'timm'. Checkpoint: {checkpoint_path}"
     )
-
-    wrapper = _TorchvisionConvNeXtStemStages(raw_cnxt)
-    if wrapper.feature_dim != model.feature_dim:
-        raise RuntimeError(
-            f"[MAE] Wrapper feature_dim mismatch: {wrapper.feature_dim} vs model {model.feature_dim}"
-        )
-
-    _load_state_dict_key_compatible(model.stem, wrapper.stem.state_dict(), "stem")
-    _load_state_dict_key_compatible(model.stages, wrapper.stages.state_dict(), "stages")
-
-    print("[MAE] Encoder weights loaded successfully into VideoClassifier")
-    print("[MAE] frame_head / quality_head / video_head are randomly initialized "
-          "(not loaded from MAE checkpoint)")
-
-    # Return metadata for config_snapshot
-    return {
-        "pretrain_type": "mae",
-        "backbone_name": "convnext_tiny",
-        "feature_dim": model.feature_dim,
-        "mask_ratio": raw_ckpt.get("mask_ratio", None),
-        "patch_size": raw_ckpt.get("patch_size", None),
-        "mae_best_loss": raw_ckpt.get("best_loss", None),
-        "mae_best_epoch": raw_ckpt.get("best_epoch", None),
-        "mae_epochs": raw_ckpt.get("epochs", None),
-        "encoder_params": raw_ckpt.get("encoder_params", None),
-        "decoder_params": raw_ckpt.get("decoder_params", None),
-    }
 
 
 # -----------------------------
