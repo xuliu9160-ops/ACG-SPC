@@ -277,6 +277,92 @@ def create_qmil_frame_head(feature_dim, num_classes):
 
 
 # -----------------------------
+#  MAE checkpoint loader
+# -----------------------------
+def load_convnext_encoder_from_mae_checkpoint(model, checkpoint_path):
+    """
+    Load ConvNeXt-Tiny encoder weights from a MAE pretrain checkpoint
+    into a VideoClassifier model.
+
+    The MAE checkpoint must contain:
+      - pretrain_type == "mae"
+      - backbone_name == "convnext_tiny"
+      - feature_dim matching model.feature_dim
+      - encoder_state_dict (keys from torchvision convnext_tiny().features)
+
+    Does NOT load frame_head / quality_head / video_head.
+    """
+    from torchvision.models.convnext import convnext_tiny
+
+    raw_ckpt = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(raw_ckpt, dict):
+        raise ValueError(f"[MAE] Invalid checkpoint format: {checkpoint_path}")
+
+    pretrain_type = raw_ckpt.get("pretrain_type", None)
+    if pretrain_type != "mae":
+        raise ValueError(
+            f"[MAE] Expected pretrain_type='mae', got '{pretrain_type}'. "
+            f"Checkpoint: {checkpoint_path}"
+        )
+
+    ckpt_bb = raw_ckpt.get("backbone_name", None)
+    if ckpt_bb != "convnext_tiny":
+        raise ValueError(
+            f"[MAE] Backbone mismatch: checkpoint='{ckpt_bb}', expected='convnext_tiny'. "
+            f"Checkpoint: {checkpoint_path}"
+        )
+
+    ckpt_fd = raw_ckpt.get("feature_dim", None)
+    if ckpt_fd is not None and int(ckpt_fd) != model.feature_dim:
+        raise ValueError(
+            f"[MAE] Feature dim mismatch: checkpoint={ckpt_fd}, model={model.feature_dim}. "
+            f"Checkpoint: {checkpoint_path}"
+        )
+
+    encoder_sd = raw_ckpt.get("encoder_state_dict", None)
+    if encoder_sd is None:
+        raise ValueError(
+            f"[MAE] Checkpoint missing 'encoder_state_dict'. "
+            f"Checkpoint: {checkpoint_path}"
+        )
+
+    # Load encoder into raw convnext_tiny, then re-wrap with existing logic
+    raw_cnxt = convnext_tiny(weights=None)
+    load_info = raw_cnxt.features.load_state_dict(encoder_sd, strict=True)
+    print(
+        "[MAE] Encoder loaded into raw convnext_tiny.features "
+        f"(missing={len(load_info.missing_keys)}, unexpected={len(load_info.unexpected_keys)})"
+    )
+
+    wrapper = _TorchvisionConvNeXtStemStages(raw_cnxt)
+    if wrapper.feature_dim != model.feature_dim:
+        raise RuntimeError(
+            f"[MAE] Wrapper feature_dim mismatch: {wrapper.feature_dim} vs model {model.feature_dim}"
+        )
+
+    model.stem.load_state_dict(wrapper.stem.state_dict())
+    model.stages.load_state_dict(wrapper.stages.state_dict())
+
+    print("[MAE] Encoder weights loaded successfully into VideoClassifier")
+    print("[MAE] frame_head / quality_head / video_head are randomly initialized "
+          "(not loaded from MAE checkpoint)")
+
+    # Return metadata for config_snapshot
+    return {
+        "pretrain_type": "mae",
+        "backbone_name": "convnext_tiny",
+        "feature_dim": model.feature_dim,
+        "mask_ratio": raw_ckpt.get("mask_ratio", None),
+        "patch_size": raw_ckpt.get("patch_size", None),
+        "mae_best_loss": raw_ckpt.get("best_loss", None),
+        "mae_best_epoch": raw_ckpt.get("best_epoch", None),
+        "mae_epochs": raw_ckpt.get("epochs", None),
+        "encoder_params": raw_ckpt.get("encoder_params", None),
+        "decoder_params": raw_ckpt.get("decoder_params", None),
+    }
+
+
+# -----------------------------
 # Video Classifier
 # -----------------------------
 class VideoClassifier(nn.Module):

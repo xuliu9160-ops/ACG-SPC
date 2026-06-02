@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from dataset import BUVFolderDataset
 from loss import combined_loss
-from model import VideoClassifier
+from model import VideoClassifier, load_convnext_encoder_from_mae_checkpoint
 
 
 # ==========================================================
@@ -346,6 +346,41 @@ def create_model():
                         f"Checkpoint: {FRAME_BRANCH_PRETRAIN_CKPT}"
                     )
 
+                # --- pretrain_type dispatch ---
+                pretrain_type = raw_ckpt.get("pretrain_type", None)
+                if pretrain_type == "mae":
+                    # MAE path: load encoder only, no frame_head
+                    mae_meta = load_convnext_encoder_from_mae_checkpoint(
+                        model, FRAME_BRANCH_PRETRAIN_CKPT
+                    )
+                    # skip supervised stanza below
+                    model = model.to(DEVICE)
+                    if USE_MULTI_GPU:
+                        model = torch.nn.DataParallel(model)
+                        print(f"Model wrapped with DataParallel (using {torch.cuda.device_count()} GPUs)")
+                    # attach metadata
+                    model._qm_backbone_name = BACKBONE_NAME
+                    model._qm_total_params = total_params
+                    model._qm_trainable_params = trainable_params
+                    model._qm_pretrain_type = "mae"
+                    model._qm_mae_meta = mae_meta
+                    _MODEL_META.update({
+                        "backbone_name": BACKBONE_NAME,
+                        "feature_dim": int(model.feature_dim),
+                        "total_params": int(total_params),
+                        "trainable_params": int(trainable_params),
+                        "pretrain_type": "mae",
+                    })
+                    return model
+
+                if pretrain_type is not None and pretrain_type != "supervised_frame_branch":
+                    raise ValueError(
+                        f"[FrameBranchPretrain] Unknown pretrain_type='{pretrain_type}'. "
+                        f"Expected 'mae' or 'supervised_frame_branch'. "
+                        f"Checkpoint: {FRAME_BRANCH_PRETRAIN_CKPT}"
+                    )
+
+                # --- supervised_frame_branch path (existing, unchanged) ---
                 normalized = {}
                 for k, v in ckpt.items():
                     nk = k[7:] if k.startswith("module.") else k
@@ -409,12 +444,14 @@ def create_model():
     model._qm_backbone_name = BACKBONE_NAME
     model._qm_total_params = total_params
     model._qm_trainable_params = trainable_params
+    model._qm_pretrain_type = "supervised_frame_branch" if ENABLE_FRAME_BRANCH_PRETRAIN else "none"
     # store globally for config_snapshot / manifest / result_summary
     _MODEL_META.update({
         "backbone_name": BACKBONE_NAME,
         "feature_dim": int(model.feature_dim),
         "total_params": int(total_params),
         "trainable_params": int(trainable_params),
+        "pretrain_type": ("supervised_frame_branch" if ENABLE_FRAME_BRANCH_PRETRAIN else "none"),
     })
     return model
 
@@ -458,6 +495,7 @@ def main():
     print(f"BACKBONE_NAME:                {BACKBONE_NAME}")
     print(f"ENABLE_FRAME_BRANCH_PRETRAIN: {ENABLE_FRAME_BRANCH_PRETRAIN}")
     print(f"FRAME_BRANCH_PRETRAIN_CKPT:   {FRAME_BRANCH_PRETRAIN_CKPT}")
+    print(f"PRETRAIN_TYPE:                {_MODEL_META.get('pretrain_type', 'unknown')}")
     print(f"FRAME_LOSS_MODE:              {FRAME_LOSS_MODE}")
     print(f"MIL_SELECT_LEVEL:             {MIL_SELECT_LEVEL}")
     print(f"MIL_POS_TOPK_SEGMENTS:        {MIL_POS_TOPK_SEGMENTS}")
@@ -818,6 +856,7 @@ def main():
             "frames_per_seg": int(FRAMES_PER_SEG),
             "batch_size": int(BATCH_SIZE),
             "enable_frame_branch_pretrain": bool(ENABLE_FRAME_BRANCH_PRETRAIN),
+            "pretrain_type": _MODEL_META.get("pretrain_type", "unknown"),
             "frame_branch_pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
             "frame_loss_mode": FRAME_LOSS_MODE,
             "mil_select_level": MIL_SELECT_LEVEL,
@@ -871,6 +910,7 @@ def main():
         "mil_selection_detach": bool(MIL_SELECTION_DETACH),
         "frame_loss_mode": FRAME_LOSS_MODE,
         "enable_frame_branch_pretrain": bool(ENABLE_FRAME_BRANCH_PRETRAIN),
+        "pretrain_type": _MODEL_META.get("pretrain_type", "unknown"),
         "frame_branch_pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
         "official_train_json_path": OFFICIAL_TRAIN_JSON,
         "fixed_test_json_path": FIXED_TEST_JSON,
@@ -890,6 +930,7 @@ def main():
     result_summary = {
         "experiment_tag": EXPERIMENT_TAG,
         "backbone_name": BACKBONE_NAME,
+        "pretrain_type": _MODEL_META.get("pretrain_type", "unknown"),
         "feature_dim": int(_MODEL_META.get("feature_dim", -1)),
         "total_params": int(_MODEL_META.get("total_params", -1)),
         "trainable_params": int(_MODEL_META.get("trainable_params", -1)),
