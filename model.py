@@ -448,9 +448,16 @@ class VideoClassifier(nn.Module):
         self.feature_dim = get_qmil_backbone_feature_dim(backbone)
 
         # --- Backbone identity metadata (used by MAE loader for integrity checks) ---
+        # Must reflect the ACTUAL implementation source, not just the caller's arg.
+        # resnet/efficientnet/mobilenet always use torchvision internally.
+        _TORCHVISION_ONLY = {"resnet18", "resnet34", "efficientnet_b0", "mobilenet_v3_large"}
         self._qm_backbone_name = str(backbone_name)
-        self._qm_backbone_source = str(backbone_source)
-        self._qm_timm_name = str(timm_name) if timm_name else None
+        if self._qm_backbone_name in _TORCHVISION_ONLY:
+            self._qm_backbone_source = "torchvision"
+            self._qm_timm_name = None
+        else:
+            self._qm_backbone_source = str(backbone_source)
+            self._qm_timm_name = str(timm_name) if timm_name else None
 
         self.quality_head = SegmentQualityMLP(in_features=self.feature_dim)
         self.frame_head = create_qmil_frame_head(self.feature_dim, num_classes)
