@@ -486,10 +486,13 @@ class VideoClassifier(nn.Module):
         frame_logits = self.frame_head(feats)
 
         seg_tokens = feats.mean(dim=2)        # [B,S,D]
-        seg_scores = self.quality_head(seg_tokens).squeeze(-1)  # [B,S]
 
         if self.selection_mode == "topk_softmax":
+            seg_scores = self.quality_head(seg_tokens).squeeze(-1)  # [B,S]
             seg_w = topk_softmax(seg_scores, k=self.topk)         # [B,S]
+        elif self.selection_mode == "mean":
+            # Uniform mean pooling: no quality_head, no top-k selection
+            seg_w = torch.full((B, S), 1.0 / S, device=seg_tokens.device, dtype=seg_tokens.dtype)
         else:
             raise ValueError(f"Unsupported selection_mode: {self.selection_mode}")
 

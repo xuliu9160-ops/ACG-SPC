@@ -130,6 +130,10 @@ FRAME_BRANCH_PRETRAIN_LOAD_FRAME_HEAD = True
 # Backbone selection
 BACKBONE_NAME = os.environ.get("BACKBONE_NAME", "convnext_tiny")
 
+# QMIL / aggregation controls
+SELECTION_MODE = os.environ.get("SELECTION_MODE", "topk_softmax")
+QMIL_TOPK = int(os.environ.get("QMIL_TOPK", "2"))
+
 
 # ==========================================================
 #  METRICS
@@ -291,8 +295,8 @@ def create_model():
         timm_name="convnext_tiny.fb_in22k",
         pretrained=True,
         backbone_name=BACKBONE_NAME,
-        selection_mode="topk_softmax",
-        topk=2,
+        selection_mode=SELECTION_MODE,
+        topk=QMIL_TOPK,
         video_dropout=0.5,
     )
     total_params, trainable_params = _count_params(model)
@@ -502,7 +506,7 @@ def main():
     print(f"MIL_MALIGNANT_CLASS_IDX:      {MIL_MALIGNANT_CLASS_IDX}")
     print(f"MIL_SELECTION_DETACH:         {MIL_SELECTION_DETACH}")
     print(f"FRAME_WEIGHT:                 {FRAME_WEIGHT}")
-    print(f"QMIL selection_mode:          topk_softmax  topk=2")
+    print(f"QMIL selection_mode:          {SELECTION_MODE}  topk={QMIL_TOPK}")
     print(f"DATASET_NAME:                 {DATASET_NAME}")
     print(f"VIDEO_ROOT:                   {DATA_ROOT}")
     print(f"OFFICIAL_TRAIN_JSON:          {OFFICIAL_TRAIN_JSON}")
@@ -855,6 +859,8 @@ def main():
             "segments": int(SEGMENTS),
             "frames_per_seg": int(FRAMES_PER_SEG),
             "batch_size": int(BATCH_SIZE),
+            "epochs": int(EPOCHS),
+            "n_repeats": int(N_REPEATS),
             "enable_frame_branch_pretrain": bool(ENABLE_FRAME_BRANCH_PRETRAIN),
             "pretrain_type": _MODEL_META.get("pretrain_type", "unknown"),
             "frame_branch_pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
@@ -863,8 +869,9 @@ def main():
             "mil_pos_topk_segments": int(MIL_POS_TOPK_SEGMENTS),
             "mil_malignant_class_idx": int(MIL_MALIGNANT_CLASS_IDX),
             "mil_selection_detach": bool(MIL_SELECTION_DETACH),
+            "selection_mode": SELECTION_MODE,
+            "qmil_topk": int(QMIL_TOPK),
             "frame_weight": FRAME_WEIGHT,
-            "qmil_topk": 2,
             "official_train_json_path": OFFICIAL_TRAIN_JSON,
             "fixed_test_json_path": FIXED_TEST_JSON,
             "video_root": DATA_ROOT,
@@ -903,8 +910,9 @@ def main():
         "epochs": EPOCHS,
         "lr": LR,
         "weight_decay": WEIGHT_DECAY,
+        "selection_mode": SELECTION_MODE,
+        "qmil_topk": int(QMIL_TOPK),
         "frame_weight": FRAME_WEIGHT,
-        "qmil_topk": 2,
         "mil_pos_topk_segments": int(MIL_POS_TOPK_SEGMENTS),
         "mil_select_level": MIL_SELECT_LEVEL,
         "mil_selection_detach": bool(MIL_SELECTION_DETACH),
@@ -934,6 +942,11 @@ def main():
         "feature_dim": int(_MODEL_META.get("feature_dim", -1)),
         "total_params": int(_MODEL_META.get("total_params", -1)),
         "trainable_params": int(_MODEL_META.get("trainable_params", -1)),
+        "selection_mode": SELECTION_MODE,
+        "qmil_topk": int(QMIL_TOPK),
+        "frame_weight": FRAME_WEIGHT,
+        "frame_loss_mode": FRAME_LOSS_MODE,
+        "enable_frame_branch_pretrain": bool(ENABLE_FRAME_BRANCH_PRETRAIN),
         "pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
         "n_repeats": int(N_REPEATS),
         "fixed_test_summary": {
