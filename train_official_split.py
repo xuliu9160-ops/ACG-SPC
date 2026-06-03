@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from dataset import BUVFolderDataset
 from loss import combined_loss
-from model import VideoClassifier, load_convnext_encoder_from_mae_checkpoint
+from model import VideoClassifier, load_mae_encoder_from_checkpoint
 
 
 # ==========================================================
@@ -350,7 +350,7 @@ def create_model():
                 pretrain_type = raw_ckpt.get("pretrain_type", None)
                 if pretrain_type == "mae":
                     # MAE path: load encoder only, no frame_head
-                    mae_meta = load_convnext_encoder_from_mae_checkpoint(
+                    mae_meta = load_mae_encoder_from_checkpoint(
                         model, FRAME_BRANCH_PRETRAIN_CKPT
                     )
                     # skip supervised stanza below

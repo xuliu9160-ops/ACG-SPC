@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import BUVImageDataset
-from mae_model import ConvNeXtMAE
+from mae_model import ConvNeXtMAE, EfficientNetB0MAE
 
 
 # -------------------------------------------------------
@@ -59,7 +59,7 @@ def set_seed(seed):
 #  Main
 # -------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser("BUSI-MAE pretraining — ConvNeXt-Tiny")
+    parser = argparse.ArgumentParser("BUSI-MAE pretraining — ConvNeXt-Tiny / EfficientNet-B0")
     parser.add_argument("--data_root", type=str, required=True,
                         help="Root dir with benign/ and malignant/ subdirs")
     parser.add_argument("--save_path", type=str, default="busi_mae_convnext_tiny_best.pth")
@@ -80,7 +80,7 @@ def main():
                         choices=["timm", "torchvision"])
     parser.add_argument("--timm_name", type=str, default="convnext_tiny.fb_in22k")
     parser.add_argument("--backbone_name", type=str, default="convnext_tiny",
-                        choices=["convnext_tiny"])
+                        choices=["convnext_tiny", "efficientnet_b0"])
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
@@ -113,18 +113,35 @@ def main():
     # ---------------------------------------------------------------
     #  Model
     # ---------------------------------------------------------------
-    model = ConvNeXtMAE(
-        backbone_source=args.backbone_source,
-        timm_name=args.timm_name,
-        backbone_name=args.backbone_name,
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        mask_ratio=args.mask_ratio,
-        pretrained=args.pretrained,
-    ).to(device)
+    backbone_name = str(args.backbone_name).lower()
+    if backbone_name == "efficientnet_b0":
+        model = EfficientNetB0MAE(
+            img_size=args.img_size,
+            patch_size=args.patch_size,
+            mask_ratio=args.mask_ratio,
+            pretrained=args.pretrained,
+        ).to(device)
+        # Override backbone_source to match actual implementation
+        backbone_source = model.backbone_source  # "torchvision"
+        timm_name_val = None
+    elif backbone_name == "convnext_tiny":
+        model = ConvNeXtMAE(
+            backbone_source=args.backbone_source,
+            timm_name=args.timm_name,
+            backbone_name=args.backbone_name,
+            img_size=args.img_size,
+            patch_size=args.patch_size,
+            mask_ratio=args.mask_ratio,
+            pretrained=args.pretrained,
+        ).to(device)
+        backbone_source = args.backbone_source
+        timm_name_val = args.timm_name if backbone_source == "timm" else None
+    else:
+        raise ValueError(f"Unsupported backbone_name: {backbone_name}")
+
     params = model.count_params()
-    print(f"[MAE] Backbone: {args.backbone_name}  source={args.backbone_source}  "
-          f"timm_name={args.timm_name}  feature_dim={model.feature_dim}")
+    print(f"[MAE] Backbone: {backbone_name}  source={backbone_source}  "
+          f"timm_name={timm_name_val}  feature_dim={model.feature_dim}")
     print(f"[MAE] Params — total={params['total']:,}  encoder={params['encoder']:,}  "
           f"decoder={params['decoder']:,}  trainable={params['trainable']:,}")
     print(f"[MAE] mask_ratio={args.mask_ratio}  patch_size={args.patch_size}  "
@@ -189,14 +206,16 @@ def main():
         scheduler.step()
 
         # Save last checkpoint
-        _save_checkpoint(model, params, args, save_path_last,
+        _save_checkpoint(model, params, backbone_name, backbone_source, timm_name_val,
+                         args, save_path_last,
                          best_loss=best_loss, best_epoch=best_epoch,
                          latest_epoch=epoch, loss_history=loss_history,
                          is_best=False)
 
         # Save best checkpoint
         if is_best:
-            _save_checkpoint(model, params, args, save_path_best,
+            _save_checkpoint(model, params, backbone_name, backbone_source, timm_name_val,
+                             args, save_path_best,
                              best_loss=best_loss, best_epoch=best_epoch,
                              latest_epoch=epoch, loss_history=loss_history,
                              is_best=True)
@@ -205,14 +224,15 @@ def main():
     print(f"[MAE] Finished.  best_epoch={best_epoch}  best_masked_loss={best_loss:.6f}")
 
 
-def _save_checkpoint(model, params, args, path, best_loss, best_epoch,
+def _save_checkpoint(model, params, backbone_name, backbone_source, timm_name_val,
+                     args, path, best_loss, best_epoch,
                      latest_epoch, loss_history, is_best):
     git_info = get_git_info()
     ckpt = {
         "pretrain_type": "mae",
-        "backbone_name": args.backbone_name,
-        "backbone_source": args.backbone_source,
-        "timm_name": args.timm_name if args.backbone_source == "timm" else None,
+        "backbone_name": backbone_name,
+        "backbone_source": backbone_source,
+        "timm_name": timm_name_val,
         "feature_dim": model.feature_dim,
         # Primary: stem/stages state_dict (for strict-load into downstream VideoClassifier)
         "stem_state_dict": model.stem.state_dict(),
