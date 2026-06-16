@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 try:
     from torchvision.models.convnext import convnext_tiny, ConvNeXt_Tiny_Weights
 except Exception:
@@ -430,12 +431,38 @@ class VideoClassifier(nn.Module):
         backbone_name: str = "convnext_tiny",    # see create_qmil_backbone
         selection_mode: str = "topk_softmax",
         topk: int = 2,
+        # --- STG-CRSA hyperparameters ---
+        stg_temperature: float = 1.0,
+        stg_tau: float = 0.0,
+        stg_gamma: float = 1.0,
+        stg_floor: float = 0.05,
+        crsa_alpha: float = 1.0,
+        crsa_center: str = "median",
+        **_unused,
     ):
         super().__init__()
         self.segment_count = int(segment_count)
         self.frames_per_segment = int(frames_per_segment)
         self.selection_mode = str(selection_mode)
         self.topk = int(topk)
+
+        # STG-CRSA config
+        self.stg_temperature = float(stg_temperature)
+        self.stg_tau = float(stg_tau)
+        self.stg_gamma = float(stg_gamma)
+        self.stg_floor = float(stg_floor)
+        self.crsa_alpha = float(crsa_alpha)
+        self.crsa_center = str(crsa_center).lower()
+        if self.crsa_center not in ("median", "mean"):
+            raise ValueError(f"crsa_center must be 'median' or 'mean', got '{crsa_center}'")
+
+        # Debug tensors (populated per forward)
+        self.last_segment_weights = None
+        self.last_stg_gate = None
+        self.last_stg_support = None
+        self.last_stg_reliability = None
+        self.last_stg_trust = None
+        self.last_seg_probs = None
 
         backbone = create_qmil_backbone(
             backbone_source=backbone_source,
@@ -490,11 +517,60 @@ class VideoClassifier(nn.Module):
         if self.selection_mode == "topk_softmax":
             seg_scores = self.quality_head(seg_tokens).squeeze(-1)  # [B,S]
             seg_w = topk_softmax(seg_scores, k=self.topk)         # [B,S]
+            self.last_stg_gate = None
+            self.last_stg_support = None
+            self.last_stg_reliability = None
+            self.last_stg_trust = None
+            self.last_seg_probs = None
         elif self.selection_mode == "mean":
             # Uniform mean pooling: no quality_head, no top-k selection
             seg_w = torch.full((B, S), 1.0 / S, device=seg_tokens.device, dtype=seg_tokens.dtype)
+            self.last_stg_gate = None
+            self.last_stg_support = None
+            self.last_stg_reliability = None
+            self.last_stg_trust = None
+            self.last_seg_probs = None
+        elif self.selection_mode == "stg_crsa":
+            # ---- STG-CRSA: Segment Trustworthiness Gating + CRSA ----
+            # Step 1: Feature support via cosine similarity (CS-FSS heritage)
+            tokens_norm = torch.nn.functional.normalize(seg_tokens, p=2, dim=-1)  # [B,S,D]
+            cos_mat = tokens_norm @ tokens_norm.transpose(1, 2)       # [B,S,S]
+            cos_sum = cos_mat.sum(dim=2)                              # [B,S]
+            diag = cos_mat.diagonal(dim1=-2, dim2=-1)                # [B,S]
+            support = (cos_sum - diag) / max(S - 1, 1)               # [B,S]  mean cos with others
+
+            # Step 2: Z-score normalize support, then gate via sigmoid
+            support_mean = support.mean(dim=1, keepdim=True)          # [B,1]
+            support_std = support.std(dim=1, keepdim=True, unbiased=False)  # [B,1]
+            support_z = (support - support_mean) / (support_std + 1e-6)     # [B,S]
+            gate = torch.sigmoid((support_z - self.stg_tau) / self.stg_temperature)  # [B,S]
+
+            # Step 3: Trust = floor + gate^gamma  (low-trust segments suppressed)
+            trust = self.stg_floor + gate.pow(self.stg_gamma)         # [B,S]
+
+            # Step 4: CRSA reliability = exp(-alpha * |prob - center|)
+            seg_logits = self.video_head(seg_tokens)                  # [B,S,2]
+            seg_probs = torch.softmax(seg_logits, dim=-1)[..., 1]     # [B,S]
+            if self.crsa_center == "median":
+                center = seg_probs.median(dim=1, keepdim=True).values  # [B,1]
+            else:
+                center = seg_probs.mean(dim=1, keepdim=True)           # [B,1]
+            reliability = torch.exp(-self.crsa_alpha * torch.abs(seg_probs - center))  # [B,S]
+
+            # Step 5: Gated aggregation — trust × reliability, then L1 normalize
+            raw_w = trust * reliability                                # [B,S]
+            seg_w = raw_w / (raw_w.sum(dim=1, keepdim=True) + 1e-8)   # [B,S]
+
+            # Store debug tensors (detached)
+            self.last_stg_gate = gate.detach()
+            self.last_stg_support = support.detach()
+            self.last_stg_reliability = reliability.detach()
+            self.last_stg_trust = trust.detach()
+            self.last_seg_probs = seg_probs.detach()
         else:
             raise ValueError(f"Unsupported selection_mode: {self.selection_mode}")
+
+        self.last_segment_weights = seg_w.detach()
 
         video_feat = (seg_tokens * seg_w.unsqueeze(-1)).sum(dim=1)  # [B,D]
         video_logits = self.video_head(video_feat)

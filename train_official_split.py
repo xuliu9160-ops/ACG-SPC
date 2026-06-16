@@ -134,6 +134,15 @@ BACKBONE_NAME = os.environ.get("BACKBONE_NAME", "convnext_tiny")
 SELECTION_MODE = os.environ.get("SELECTION_MODE", "topk_softmax")
 QMIL_TOPK = int(os.environ.get("QMIL_TOPK", "2"))
 
+# ---- STG-CRSA hyperparameters (only used when SELECTION_MODE == "stg_crsa") ----
+STG_TEMPERATURE = float(os.environ.get("STG_TEMPERATURE", "1.0"))
+STG_TAU = float(os.environ.get("STG_TAU", "0.0"))
+STG_GAMMA = float(os.environ.get("STG_GAMMA", "1.0"))
+STG_FLOOR = float(os.environ.get("STG_FLOOR", "0.05"))
+CRSA_ALPHA = float(os.environ.get("CRSA_ALPHA", "1.0"))
+CRSA_CENTER = os.environ.get("CRSA_CENTER", "median").strip().lower()
+assert CRSA_CENTER in ("median", "mean"), f"CRSA_CENTER must be 'median' or 'mean', got '{CRSA_CENTER}'"
+
 
 # ==========================================================
 #  METRICS
@@ -298,6 +307,12 @@ def create_model():
         selection_mode=SELECTION_MODE,
         topk=QMIL_TOPK,
         video_dropout=0.5,
+        stg_temperature=STG_TEMPERATURE,
+        stg_tau=STG_TAU,
+        stg_gamma=STG_GAMMA,
+        stg_floor=STG_FLOOR,
+        crsa_alpha=CRSA_ALPHA,
+        crsa_center=CRSA_CENTER,
     )
     total_params, trainable_params = _count_params(model)
     print(
@@ -456,6 +471,13 @@ def create_model():
         "total_params": int(total_params),
         "trainable_params": int(trainable_params),
         "pretrain_type": ("supervised_frame_branch" if ENABLE_FRAME_BRANCH_PRETRAIN else "none"),
+        "selection_mode": SELECTION_MODE,
+        "stg_temperature": STG_TEMPERATURE if SELECTION_MODE == "stg_crsa" else None,
+        "stg_tau": STG_TAU if SELECTION_MODE == "stg_crsa" else None,
+        "stg_gamma": STG_GAMMA if SELECTION_MODE == "stg_crsa" else None,
+        "stg_floor": STG_FLOOR if SELECTION_MODE == "stg_crsa" else None,
+        "crsa_alpha": CRSA_ALPHA if SELECTION_MODE == "stg_crsa" else None,
+        "crsa_center": CRSA_CENTER if SELECTION_MODE == "stg_crsa" else None,
     })
     return model
 
@@ -507,6 +529,13 @@ def main():
     print(f"MIL_SELECTION_DETACH:         {MIL_SELECTION_DETACH}")
     print(f"FRAME_WEIGHT:                 {FRAME_WEIGHT}")
     print(f"QMIL selection_mode:          {SELECTION_MODE}  topk={QMIL_TOPK}")
+    if SELECTION_MODE == "stg_crsa":
+        print(f"STG_TEMPERATURE:              {STG_TEMPERATURE}")
+        print(f"STG_TAU:                      {STG_TAU}")
+        print(f"STG_GAMMA:                    {STG_GAMMA}")
+        print(f"STG_FLOOR:                    {STG_FLOOR}")
+        print(f"CRSA_ALPHA:                   {CRSA_ALPHA}")
+        print(f"CRSA_CENTER:                  {CRSA_CENTER}")
     print(f"DATASET_NAME:                 {DATASET_NAME}")
     print(f"VIDEO_ROOT:                   {DATA_ROOT}")
     print(f"OFFICIAL_TRAIN_JSON:          {OFFICIAL_TRAIN_JSON}")
@@ -872,6 +901,12 @@ def main():
             "selection_mode": SELECTION_MODE,
             "qmil_topk": int(QMIL_TOPK),
             "frame_weight": FRAME_WEIGHT,
+            "stg_temperature": STG_TEMPERATURE if SELECTION_MODE == "stg_crsa" else None,
+            "stg_tau": STG_TAU if SELECTION_MODE == "stg_crsa" else None,
+            "stg_gamma": STG_GAMMA if SELECTION_MODE == "stg_crsa" else None,
+            "stg_floor": STG_FLOOR if SELECTION_MODE == "stg_crsa" else None,
+            "crsa_alpha": CRSA_ALPHA if SELECTION_MODE == "stg_crsa" else None,
+            "crsa_center": CRSA_CENTER if SELECTION_MODE == "stg_crsa" else None,
             "official_train_json_path": OFFICIAL_TRAIN_JSON,
             "fixed_test_json_path": FIXED_TEST_JSON,
             "video_root": DATA_ROOT,
@@ -913,6 +948,12 @@ def main():
         "selection_mode": SELECTION_MODE,
         "qmil_topk": int(QMIL_TOPK),
         "frame_weight": FRAME_WEIGHT,
+        "stg_temperature": STG_TEMPERATURE if SELECTION_MODE == "stg_crsa" else None,
+        "stg_tau": STG_TAU if SELECTION_MODE == "stg_crsa" else None,
+        "stg_gamma": STG_GAMMA if SELECTION_MODE == "stg_crsa" else None,
+        "stg_floor": STG_FLOOR if SELECTION_MODE == "stg_crsa" else None,
+        "crsa_alpha": CRSA_ALPHA if SELECTION_MODE == "stg_crsa" else None,
+        "crsa_center": CRSA_CENTER if SELECTION_MODE == "stg_crsa" else None,
         "mil_pos_topk_segments": int(MIL_POS_TOPK_SEGMENTS),
         "mil_select_level": MIL_SELECT_LEVEL,
         "mil_selection_detach": bool(MIL_SELECTION_DETACH),
