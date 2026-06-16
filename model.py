@@ -438,6 +438,7 @@ class VideoClassifier(nn.Module):
         stg_floor: float = 0.05,
         crsa_alpha: float = 1.0,
         crsa_center: str = "median",
+        stg_residual_lambda: float = 0.25,
         **_unused,
     ):
         super().__init__()
@@ -455,9 +456,11 @@ class VideoClassifier(nn.Module):
         self.crsa_center = str(crsa_center).lower()
         if self.crsa_center not in ("median", "mean"):
             raise ValueError(f"crsa_center must be 'median' or 'mean', got '{crsa_center}'")
+        self.stg_residual_lambda = float(stg_residual_lambda)
 
         # Debug tensors (populated per forward)
         self.last_segment_weights = None
+        self.last_stg_raw_weights = None
         self.last_stg_gate = None
         self.last_stg_support = None
         self.last_stg_reliability = None
@@ -517,6 +520,7 @@ class VideoClassifier(nn.Module):
         if self.selection_mode == "topk_softmax":
             seg_scores = self.quality_head(seg_tokens).squeeze(-1)  # [B,S]
             seg_w = topk_softmax(seg_scores, k=self.topk)         # [B,S]
+            self.last_stg_raw_weights = None
             self.last_stg_gate = None
             self.last_stg_support = None
             self.last_stg_reliability = None
@@ -525,13 +529,16 @@ class VideoClassifier(nn.Module):
         elif self.selection_mode == "mean":
             # Uniform mean pooling: no quality_head, no top-k selection
             seg_w = torch.full((B, S), 1.0 / S, device=seg_tokens.device, dtype=seg_tokens.dtype)
+            self.last_stg_raw_weights = None
             self.last_stg_gate = None
             self.last_stg_support = None
             self.last_stg_reliability = None
             self.last_stg_trust = None
             self.last_seg_probs = None
-        elif self.selection_mode == "stg_crsa":
+        elif self.selection_mode in ("stg_crsa", "stg_crsa_residual"):
             # ---- STG-CRSA: Segment Trustworthiness Gating + CRSA ----
+            # Steps 1-5 are shared between v1 (stg_crsa) and v2 (stg_crsa_residual).
+            #
             # Step 1: Feature support via cosine similarity (CS-FSS heritage)
             tokens_norm = torch.nn.functional.normalize(seg_tokens, p=2, dim=-1)  # [B,S,D]
             cos_mat = tokens_norm @ tokens_norm.transpose(1, 2)       # [B,S,S]
@@ -559,9 +566,22 @@ class VideoClassifier(nn.Module):
 
             # Step 5: Gated aggregation — trust × reliability, then L1 normalize
             raw_w = trust * reliability                                # [B,S]
-            seg_w = raw_w / (raw_w.sum(dim=1, keepdim=True) + 1e-8)   # [B,S]
+            stg_raw_w = raw_w / (raw_w.sum(dim=1, keepdim=True) + 1e-8)  # [B,S]
+
+            if self.selection_mode == "stg_crsa_residual":
+                # ---- v2: Residual mix with uniform weights ----
+                # Mean pooling retains clean baseline stability;
+                # STG-CRSA acts as a weak calibration term via lambda.
+                uniform_w = torch.full((B, S), 1.0 / S, device=stg_raw_w.device, dtype=stg_raw_w.dtype)
+                lam = self.stg_residual_lambda
+                seg_w = (1.0 - lam) * uniform_w + lam * stg_raw_w
+                seg_w = seg_w / (seg_w.sum(dim=1, keepdim=True) + 1e-8)  # re-normalize
+            else:
+                # v1: pure STG-CRSA (no residual)
+                seg_w = stg_raw_w
 
             # Store debug tensors (detached)
+            self.last_stg_raw_weights = stg_raw_w.detach()
             self.last_stg_gate = gate.detach()
             self.last_stg_support = support.detach()
             self.last_stg_reliability = reliability.detach()
