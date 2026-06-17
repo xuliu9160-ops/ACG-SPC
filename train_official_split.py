@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -144,8 +145,24 @@ CRSA_CENTER = os.environ.get("CRSA_CENTER", "median").strip().lower()
 assert CRSA_CENTER in ("median", "mean"), f"CRSA_CENTER must be 'median' or 'mean', got '{CRSA_CENTER}'"
 STG_RESIDUAL_LAMBDA = float(os.environ.get("STG_RESIDUAL_LAMBDA", "0.25"))
 
+# ---- ACG-STG: Adaptive Gate hyperparameters ----
+STG_ADAPTIVE_GATE = os.environ.get("STG_ADAPTIVE_GATE", "none").strip().lower()
+assert STG_ADAPTIVE_GATE in ("none", "stats3", "mlp"), \
+    f"STG_ADAPTIVE_GATE must be 'none', 'stats3', or 'mlp', got '{STG_ADAPTIVE_GATE}'"
+STG_GATE_DETACH_STATS = os.environ.get("STG_GATE_DETACH_STATS", "1").lower() not in ("0", "false", "no")
+STG_GATE_BUDGET_WEIGHT = float(os.environ.get("STG_GATE_BUDGET_WEIGHT", "0.0"))
+STG_GATE_BUDGET_RHO = float(os.environ.get("STG_GATE_BUDGET_RHO", "0.7"))
+STG_GATE_INIT_BIAS = float(os.environ.get("STG_GATE_INIT_BIAS", "0.0"))
+STG_GATE_LOG = os.environ.get("STG_GATE_LOG", "1").lower() not in ("0", "false", "no")
+
 # Derived flag: any STG-CRSA mode
 _STG_CRSA_ACTIVE = SELECTION_MODE.startswith("stg_crsa")
+
+# Derived flag: ACG-STG active
+_ACG_STG_ACTIVE = (
+    SELECTION_MODE == "stg_crsa_residual"
+    and STG_ADAPTIVE_GATE != "none"
+)
 
 
 # ==========================================================
@@ -318,6 +335,10 @@ def create_model():
         crsa_alpha=CRSA_ALPHA,
         crsa_center=CRSA_CENTER,
         stg_residual_lambda=STG_RESIDUAL_LAMBDA,
+        stg_adaptive_gate=STG_ADAPTIVE_GATE,
+        stg_gate_detach_stats=STG_GATE_DETACH_STATS,
+        stg_gate_init_bias=STG_GATE_INIT_BIAS,
+        stg_gate_log=STG_GATE_LOG,
     )
     total_params, trainable_params = _count_params(model)
     print(
@@ -394,6 +415,12 @@ def create_model():
                         "total_params": int(total_params),
                         "trainable_params": int(trainable_params),
                         "pretrain_type": "mae",
+                        "selection_mode": SELECTION_MODE,
+                        "stg_adaptive_gate": STG_ADAPTIVE_GATE if _ACG_STG_ACTIVE else None,
+                        "stg_gate_detach_stats": STG_GATE_DETACH_STATS if _ACG_STG_ACTIVE else None,
+                        "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
+                        "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
+                        "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
                     })
                     return model
 
@@ -484,6 +511,11 @@ def create_model():
         "crsa_alpha": CRSA_ALPHA if _STG_CRSA_ACTIVE else None,
         "crsa_center": CRSA_CENTER if _STG_CRSA_ACTIVE else None,
         "stg_residual_lambda": STG_RESIDUAL_LAMBDA if _STG_CRSA_ACTIVE else None,
+        "stg_adaptive_gate": STG_ADAPTIVE_GATE if _ACG_STG_ACTIVE else None,
+        "stg_gate_detach_stats": STG_GATE_DETACH_STATS if _ACG_STG_ACTIVE else None,
+        "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
+        "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
+        "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
     })
     return model
 
@@ -521,6 +553,12 @@ def get_commit_hash():
 
 
 def main():
+    train_log_path = os.path.join(SAVE_DIR, "train.log")
+    train_log_fp = open(train_log_path, "w", encoding="utf-8", buffering=1)  # line-buffered
+    def _log(msg):
+        print(msg)
+        train_log_fp.write(msg + "\n")
+
     print("=" * 80)
     print("REVERSE ABLATION CONFIG")
     print(f"EXPERIMENT_TAG:               {EXPERIMENT_TAG}")
@@ -544,6 +582,13 @@ def main():
         print(f"CRSA_CENTER:                  {CRSA_CENTER}")
         if SELECTION_MODE == "stg_crsa_residual":
             print(f"STG_RESIDUAL_LAMBDA:          {STG_RESIDUAL_LAMBDA}")
+    if _ACG_STG_ACTIVE:
+        print(f"STG_ADAPTIVE_GATE:            {STG_ADAPTIVE_GATE}")
+        print(f"STG_GATE_DETACH_STATS:        {STG_GATE_DETACH_STATS}")
+        print(f"STG_GATE_INIT_BIAS:           {STG_GATE_INIT_BIAS}")
+        print(f"STG_GATE_BUDGET_WEIGHT:       {STG_GATE_BUDGET_WEIGHT}")
+        print(f"STG_GATE_BUDGET_RHO:          {STG_GATE_BUDGET_RHO}")
+        print(f"STG_GATE_LOG:                 {STG_GATE_LOG}")
     print(f"DATASET_NAME:                 {DATASET_NAME}")
     print(f"VIDEO_ROOT:                   {DATA_ROOT}")
     print(f"OFFICIAL_TRAIN_JSON:          {OFFICIAL_TRAIN_JSON}")
@@ -692,6 +737,9 @@ def main():
         for epoch in range(1, EPOCHS + 1):
             model.train()
             running_loss, running_correct, running_total = 0.0, 0, 0
+            epoch_gate_vals = []      # accumulated gate values for logging
+            epoch_lambda_vals = []    # accumulated lambda_eff values for logging
+            epoch_budget_vals = []    # accumulated budget loss values
 
             pbar = tqdm(train_loader, desc=f"Repeat {repeat_idx} Epoch {epoch}/{EPOCHS}", leave=False)
             for videos, labels in pbar:
@@ -715,6 +763,27 @@ def main():
                         mil_malignant_class_idx=MIL_MALIGNANT_CLASS_IDX,
                         mil_selection_detach=MIL_SELECTION_DETACH,
                     )
+
+                    # ---- ACG-STG: gate stats accumulation & budget loss ----
+                    if _ACG_STG_ACTIVE:
+                        base_model = _get_base_model(model)
+                        gate_raw = getattr(base_model, "last_gate_raw", None)
+                        if gate_raw is not None:
+                            # Budget loss (only when beta > 0)
+                            if STG_GATE_BUDGET_WEIGHT > 0:
+                                g_mean = gate_raw.mean()
+                                budget_loss = (
+                                    STG_GATE_BUDGET_WEIGHT
+                                    * F.relu(g_mean - STG_GATE_BUDGET_RHO) ** 2
+                                )
+                                loss = loss + budget_loss
+                                epoch_budget_vals.append(float(budget_loss.detach().item()))
+
+                            # Accumulate for logging
+                            gate_stats = getattr(base_model, "last_gate_stats", None)
+                            if gate_stats is not None:
+                                epoch_gate_vals.append(gate_stats["gate"].detach().cpu())
+                                epoch_lambda_vals.append(gate_stats["lambda_eff"].detach().cpu())
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -757,8 +826,25 @@ def main():
 
             torch.save(model.state_dict(), last_path)
 
-            history.append(
-                {
+            # ---- ACG-STG: gate stats logging ----
+            gate_log_entry = None
+            if _ACG_STG_ACTIVE and len(epoch_gate_vals) > 0:
+                all_gates = torch.cat(epoch_gate_vals)       # [total_B]
+                all_lambdas = torch.cat(epoch_lambda_vals)   # [total_B]
+                gate_log_entry = {
+                    "gate_mean": float(all_gates.mean().item()),
+                    "gate_std": float(all_gates.std().item()),
+                    "gate_min": float(all_gates.min().item()),
+                    "gate_max": float(all_gates.max().item()),
+                    "lambda_eff_mean": float(all_lambdas.mean().item()),
+                    "lambda_eff_std": float(all_lambdas.std().item()),
+                }
+                if STG_GATE_BUDGET_WEIGHT > 0 and len(epoch_budget_vals) > 0:
+                    gate_log_entry["budget_loss_mean"] = float(
+                        sum(epoch_budget_vals) / max(1, len(epoch_budget_vals))
+                    )
+
+            _hist_entry = {
                     "epoch": int(epoch),
                     "train_loss": float(train_loss),
                     "train_acc": float(train_acc),
@@ -770,13 +856,28 @@ def main():
                     "is_best_epoch": bool(is_best),
                     "lr": float(optimizer.param_groups[0]["lr"]),
                 }
-            )
+            if gate_log_entry is not None:
+                _hist_entry["acg_stg_gate"] = gate_log_entry
+            history.append(_hist_entry)
 
             print("\n" + "-" * 100)
             print(
                 f"Repeat {repeat_idx} | Epoch {epoch}/{EPOCHS} | "
                 f"Train loss={train_loss:.4f}, acc={train_acc:.3f}"
             )
+            if gate_log_entry is not None:
+                _log(
+                    f"[ACG-STG] gate_mean={gate_log_entry['gate_mean']:.4f} "
+                    f"gate_std={gate_log_entry['gate_std']:.4f} "
+                    f"gate_min={gate_log_entry['gate_min']:.4f} "
+                    f"gate_max={gate_log_entry['gate_max']:.4f} "
+                    f"lambda_eff_mean={gate_log_entry['lambda_eff_mean']:.4f} "
+                    f"lambda_eff_std={gate_log_entry['lambda_eff_std']:.4f}"
+                    + (
+                        f" budget_loss={gate_log_entry.get('budget_loss_mean', 0.0):.6f}"
+                        if STG_GATE_BUDGET_WEIGHT > 0 else ""
+                    )
+                )
             print(
                 f"Internal Val | AUC={iv_auc:.4f}, AUPRC={iv_auprc:.4f}, "
                 f"best_auc={best_val_auc:.4f} @epoch {best_epoch}"
@@ -915,7 +1016,12 @@ def main():
             "stg_floor": STG_FLOOR if _STG_CRSA_ACTIVE else None,
             "crsa_alpha": CRSA_ALPHA if _STG_CRSA_ACTIVE else None,
             "crsa_center": CRSA_CENTER if _STG_CRSA_ACTIVE else None,
-        "stg_residual_lambda": STG_RESIDUAL_LAMBDA if _STG_CRSA_ACTIVE else None,
+            "stg_residual_lambda": STG_RESIDUAL_LAMBDA if _STG_CRSA_ACTIVE else None,
+            "stg_adaptive_gate": STG_ADAPTIVE_GATE if _ACG_STG_ACTIVE else None,
+            "stg_gate_detach_stats": STG_GATE_DETACH_STATS if _ACG_STG_ACTIVE else None,
+            "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
+            "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
+            "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
             "official_train_json_path": OFFICIAL_TRAIN_JSON,
             "fixed_test_json_path": FIXED_TEST_JSON,
             "video_root": DATA_ROOT,
@@ -964,6 +1070,11 @@ def main():
         "crsa_alpha": CRSA_ALPHA if _STG_CRSA_ACTIVE else None,
         "crsa_center": CRSA_CENTER if _STG_CRSA_ACTIVE else None,
         "stg_residual_lambda": STG_RESIDUAL_LAMBDA if _STG_CRSA_ACTIVE else None,
+        "stg_adaptive_gate": STG_ADAPTIVE_GATE if _ACG_STG_ACTIVE else None,
+        "stg_gate_detach_stats": STG_GATE_DETACH_STATS if _ACG_STG_ACTIVE else None,
+        "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
+        "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
+        "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
         "mil_pos_topk_segments": int(MIL_POS_TOPK_SEGMENTS),
         "mil_select_level": MIL_SELECT_LEVEL,
         "mil_selection_detach": bool(MIL_SELECTION_DETACH),
@@ -1000,6 +1111,10 @@ def main():
         "enable_frame_branch_pretrain": bool(ENABLE_FRAME_BRANCH_PRETRAIN),
         "pretrain_ckpt": FRAME_BRANCH_PRETRAIN_CKPT,
         "n_repeats": int(N_REPEATS),
+        "stg_adaptive_gate": STG_ADAPTIVE_GATE if _ACG_STG_ACTIVE else None,
+        "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
+        "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+        "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
         "fixed_test_summary": {
             "auc": {"mean": auc_m, "std": auc_s},
             "auprc": {"mean": auprc_m, "std": auprc_s},
@@ -1056,6 +1171,8 @@ def main():
     print(f"Summary JSON:      {summary_path}")
     print(f"Manifest JSON:     {manifest_path}")
     print(f"Result Summary:    {result_summary_path}")
+    print(f"Train Log:         {train_log_path}")
+    train_log_fp.close()
 
 
 if __name__ == "__main__":

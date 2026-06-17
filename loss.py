@@ -3,6 +3,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def gate_budget_loss(gate_values: torch.Tensor, rho: float = 0.7, beta: float = 0.0):
+    """ACG-STG optional budget regularizer: penalize when mean(gate) > rho.
+
+    L_budget = beta * relu(mean(g) - rho)^2
+
+    Args:
+        gate_values: [B, 1] per-video gate outputs (non-detached).
+        rho: target budget (default 0.7).
+        beta: loss weight (default 0.0 = disabled).
+
+    Returns:
+        Scalar loss tensor (0.0 when beta=0 or gate is None).
+    """
+    if beta <= 0.0 or gate_values is None:
+        return torch.tensor(0.0, device=gate_values.device if gate_values is not None else "cpu")
+    g_mean = gate_values.mean()
+    return beta * F.relu(g_mean - rho) ** 2
+
+
 def combined_loss(
     frame_logits: torch.Tensor,
     video_logits: torch.Tensor,
