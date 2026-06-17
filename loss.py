@@ -3,6 +3,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def pairwise_ranking_loss(
+    video_logits: torch.Tensor,
+    labels: torch.Tensor,
+    tau: float = 0.2,
+    margin: float = 0.0,
+    use_prob: bool = False,
+):
+    """Batch-level all-pair ranking loss: encourage malignant scores > benign scores.
+
+    score = video_logits[:, 1] - video_logits[:, 0]   (logit margin, default)
+    If use_prob=True: score = softmax(video_logits, dim=-1)[:, 1]
+
+    L = mean_{i:pos, j:neg} softplus((margin - (s_i - s_j)) / tau)
+
+    Args:
+        video_logits: [B, 2]
+        labels:       [B] binary labels (0=benign, 1=malignant)
+        tau:          temperature for softplus (default 0.2)
+        margin:       margin in logit space (default 0.0)
+        use_prob:     if True, use malignant probability instead of logit diff
+
+    Returns:
+        Scalar ranking loss, or 0.0 when batch has only one class.
+    """
+    B = video_logits.size(0)
+    pos_mask = labels == 1
+    neg_mask = labels == 0
+
+    if pos_mask.sum() == 0 or neg_mask.sum() == 0:
+        # No pair to rank — return zero loss without error
+        return video_logits.new_tensor(0.0)
+
+    if use_prob:
+        score = torch.softmax(video_logits, dim=-1)[:, 1]  # [B]
+    else:
+        score = video_logits[:, 1] - video_logits[:, 0]     # [B]
+
+    pos_scores = score[pos_mask]   # [N_pos]
+    neg_scores = score[neg_mask]   # [N_neg]
+
+    # All-pair differences: [N_pos, N_neg]
+    diff = pos_scores[:, None] - neg_scores[None, :]
+
+    loss = F.softplus((margin - diff) / tau).mean()
+
+    return loss
+
+
 def gate_budget_loss(gate_values: torch.Tensor, rho: float = 0.7, beta: float = 0.0):
     """ACG-STG optional budget regularizer: penalize when mean(gate) > rho.
 

@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import BUVFolderDataset
-from loss import combined_loss
+from loss import combined_loss, pairwise_ranking_loss
 from model import VideoClassifier, load_mae_encoder_from_checkpoint
 
 
@@ -163,6 +163,16 @@ _ACG_STG_ACTIVE = (
     SELECTION_MODE == "stg_crsa_residual"
     and STG_ADAPTIVE_GATE != "none"
 )
+
+# ---- Ranking Loss hyperparameters ----
+RANK_LOSS_WEIGHT = float(os.environ.get("RANK_LOSS_WEIGHT", "0.0"))
+RANK_LOSS_TAU = float(os.environ.get("RANK_LOSS_TAU", "0.2"))
+RANK_LOSS_MARGIN = float(os.environ.get("RANK_LOSS_MARGIN", "0.0"))
+RANK_LOSS_WARMUP_EPOCHS = int(os.environ.get("RANK_LOSS_WARMUP_EPOCHS", "5"))
+RANK_LOSS_USE_PROB = os.environ.get("RANK_LOSS_USE_PROB", "0").lower() not in ("0", "false", "no")
+
+# Derived flag: ranking loss active
+_RANK_LOSS_ACTIVE = RANK_LOSS_WEIGHT > 0.0
 
 
 # ==========================================================
@@ -421,6 +431,11 @@ def create_model():
                         "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
                         "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
                         "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+                        "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
+                        "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
+                        "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
+                        "rank_loss_warmup_epochs": RANK_LOSS_WARMUP_EPOCHS if _RANK_LOSS_ACTIVE else None,
+                        "rank_loss_use_prob": RANK_LOSS_USE_PROB if _RANK_LOSS_ACTIVE else None,
                     })
                     return model
 
@@ -516,6 +531,11 @@ def create_model():
         "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+        "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_warmup_epochs": RANK_LOSS_WARMUP_EPOCHS if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_use_prob": RANK_LOSS_USE_PROB if _RANK_LOSS_ACTIVE else None,
     })
     return model
 
@@ -589,6 +609,12 @@ def main():
         print(f"STG_GATE_BUDGET_WEIGHT:       {STG_GATE_BUDGET_WEIGHT}")
         print(f"STG_GATE_BUDGET_RHO:          {STG_GATE_BUDGET_RHO}")
         print(f"STG_GATE_LOG:                 {STG_GATE_LOG}")
+    if _RANK_LOSS_ACTIVE:
+        print(f"RANK_LOSS_WEIGHT:             {RANK_LOSS_WEIGHT}")
+        print(f"RANK_LOSS_TAU:                {RANK_LOSS_TAU}")
+        print(f"RANK_LOSS_MARGIN:             {RANK_LOSS_MARGIN}")
+        print(f"RANK_LOSS_WARMUP_EPOCHS:      {RANK_LOSS_WARMUP_EPOCHS}")
+        print(f"RANK_LOSS_USE_PROB:           {RANK_LOSS_USE_PROB}")
     print(f"DATASET_NAME:                 {DATASET_NAME}")
     print(f"VIDEO_ROOT:                   {DATA_ROOT}")
     print(f"OFFICIAL_TRAIN_JSON:          {OFFICIAL_TRAIN_JSON}")
@@ -740,6 +766,15 @@ def main():
             epoch_gate_vals = []      # accumulated gate values for logging
             epoch_lambda_vals = []    # accumulated lambda_eff values for logging
             epoch_budget_vals = []    # accumulated budget loss values
+            epoch_rank_vals = []      # accumulated ranking loss values
+
+            # ---- Ranking loss warmup ----
+            if _RANK_LOSS_ACTIVE:
+                rank_weight_eff = RANK_LOSS_WEIGHT
+                if epoch <= RANK_LOSS_WARMUP_EPOCHS:
+                    rank_weight_eff = RANK_LOSS_WEIGHT * float(epoch) / float(max(1, RANK_LOSS_WARMUP_EPOCHS))
+            else:
+                rank_weight_eff = 0.0
 
             pbar = tqdm(train_loader, desc=f"Repeat {repeat_idx} Epoch {epoch}/{EPOCHS}", leave=False)
             for videos, labels in pbar:
@@ -763,6 +798,20 @@ def main():
                         mil_malignant_class_idx=MIL_MALIGNANT_CLASS_IDX,
                         mil_selection_detach=MIL_SELECTION_DETACH,
                     )
+
+                    # ---- Ranking loss ----
+                    rank_loss_val = video_logits.new_tensor(0.0)
+                    if _RANK_LOSS_ACTIVE:
+                        rank_loss_val = pairwise_ranking_loss(
+                            video_logits,
+                            labels,
+                            tau=RANK_LOSS_TAU,
+                            margin=RANK_LOSS_MARGIN,
+                            use_prob=RANK_LOSS_USE_PROB,
+                        )
+                        if rank_weight_eff > 0.0 and rank_loss_val.item() > 0.0:
+                            loss = loss + rank_weight_eff * rank_loss_val
+                        epoch_rank_vals.append(float(rank_loss_val.detach().item()))
 
                     # ---- ACG-STG: gate stats accumulation & budget loss ----
                     if _ACG_STG_ACTIVE:
@@ -801,6 +850,7 @@ def main():
                     acc=float(running_correct / max(1, running_total)),
                     frame=float(frame_loss_val.item()),
                     video=float(video_loss_val.item()),
+                    rank=float(rank_loss_val.detach().item()) if _RANK_LOSS_ACTIVE else None,
                     lr=float(optimizer.param_groups[0]["lr"]),
                 )
 
@@ -844,6 +894,15 @@ def main():
                         sum(epoch_budget_vals) / max(1, len(epoch_budget_vals))
                     )
 
+            # ---- Ranking loss: epoch summary ----
+            rank_log_entry = None
+            if _RANK_LOSS_ACTIVE and len(epoch_rank_vals) > 0:
+                rank_loss_mean = float(sum(epoch_rank_vals) / max(1, len(epoch_rank_vals)))
+                rank_log_entry = {
+                    "rank_loss": rank_loss_mean,
+                    "rank_weight_eff": float(rank_weight_eff),
+                }
+
             _hist_entry = {
                     "epoch": int(epoch),
                     "train_loss": float(train_loss),
@@ -858,6 +917,8 @@ def main():
                 }
             if gate_log_entry is not None:
                 _hist_entry["acg_stg_gate"] = gate_log_entry
+            if rank_log_entry is not None:
+                _hist_entry["rank_loss"] = rank_log_entry
             history.append(_hist_entry)
 
             print("\n" + "-" * 100)
@@ -877,6 +938,11 @@ def main():
                         f" budget_loss={gate_log_entry.get('budget_loss_mean', 0.0):.6f}"
                         if STG_GATE_BUDGET_WEIGHT > 0 else ""
                     )
+                )
+            if rank_log_entry is not None:
+                _log(
+                    f"[RankLoss] weight_eff={rank_log_entry['rank_weight_eff']:.4f} "
+                    f"rank_loss={rank_log_entry['rank_loss']:.6f}"
                 )
             print(
                 f"Internal Val | AUC={iv_auc:.4f}, AUPRC={iv_auprc:.4f}, "
@@ -1022,6 +1088,11 @@ def main():
             "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
             "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
             "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+            "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
+            "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
+            "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
+            "rank_loss_warmup_epochs": RANK_LOSS_WARMUP_EPOCHS if _RANK_LOSS_ACTIVE else None,
+            "rank_loss_use_prob": RANK_LOSS_USE_PROB if _RANK_LOSS_ACTIVE else None,
             "official_train_json_path": OFFICIAL_TRAIN_JSON,
             "fixed_test_json_path": FIXED_TEST_JSON,
             "video_root": DATA_ROOT,
@@ -1075,6 +1146,11 @@ def main():
         "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+        "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_warmup_epochs": RANK_LOSS_WARMUP_EPOCHS if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_use_prob": RANK_LOSS_USE_PROB if _RANK_LOSS_ACTIVE else None,
         "mil_pos_topk_segments": int(MIL_POS_TOPK_SEGMENTS),
         "mil_select_level": MIL_SELECT_LEVEL,
         "mil_selection_detach": bool(MIL_SELECTION_DETACH),
@@ -1115,6 +1191,9 @@ def main():
         "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
         "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
+        "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
+        "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
         "fixed_test_summary": {
             "auc": {"mean": auc_m, "std": auc_s},
             "auprc": {"mean": auprc_m, "std": auprc_s},
@@ -1172,6 +1251,28 @@ def main():
     print(f"Manifest JSON:     {manifest_path}")
     print(f"Result Summary:    {result_summary_path}")
     print(f"Train Log:         {train_log_path}")
+
+    # --- env_snapshot.txt ---
+    env_snapshot_path = os.path.join(SAVE_DIR, "env_snapshot.txt")
+    with open(env_snapshot_path, "w", encoding="utf-8") as f:
+        _env_keys = [
+            "DATASET_NAME", "EXPERIMENT_TAG", "BACKBONE_NAME", "SELECTION_MODE",
+            "QMIL_TOPK", "EPOCHS", "BATCH_SIZE", "N_REPEATS", "SEED",
+            "SEGMENTS", "FRAMES_PER_SEG", "FRAME_LOSS_MODE", "FRAME_WEIGHT",
+            "MIL_SELECT_LEVEL", "MIL_POS_TOPK_SEGMENTS", "MIL_MALIGNANT_CLASS_IDX",
+            "MIL_SELECTION_DETACH", "ENABLE_FRAME_BRANCH_PRETRAIN",
+            "STG_TEMPERATURE", "STG_TAU", "STG_GAMMA", "STG_FLOOR",
+            "CRSA_ALPHA", "CRSA_CENTER", "STG_RESIDUAL_LAMBDA",
+            "STG_ADAPTIVE_GATE", "STG_GATE_DETACH_STATS", "STG_GATE_BUDGET_WEIGHT",
+            "STG_GATE_BUDGET_RHO", "STG_GATE_INIT_BIAS", "STG_GATE_LOG",
+            "RANK_LOSS_WEIGHT", "RANK_LOSS_TAU", "RANK_LOSS_MARGIN",
+            "RANK_LOSS_WARMUP_EPOCHS", "RANK_LOSS_USE_PROB",
+        ]
+        for k in _env_keys:
+            v = os.environ.get(k, "")
+            f.write(f"{k}={v}\n")
+    print(f"Env Snapshot:      {env_snapshot_path}")
+
     train_log_fp.close()
 
 
