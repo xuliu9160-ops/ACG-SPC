@@ -578,21 +578,12 @@ class VideoClassifier(nn.Module):
         self.stg_delta_min = float(stg_delta_min)
         self.stg_delta_max = float(stg_delta_max)
 
-        # Build adaptive gate module (only when selection_mode is stg_crsa_residual
-        # and stg_adaptive_gate is not "none")
-        if self.selection_mode == "stg_crsa_residual" and self.stg_adaptive_gate != "none":
-            if self.stg_adaptive_gate == "stats3":
-                self.acg_gate = _Stats3Gate(init_bias=self.stg_gate_init_bias)
-            elif self.stg_adaptive_gate == "mlp":
-                self.acg_gate = _MLPGate(init_bias=self.stg_gate_init_bias)
-            elif self.stg_adaptive_gate == "stats3_delta":
-                self.acg_gate = _Stats3DeltaGate()
-            elif self.stg_adaptive_gate == "mlp_delta":
-                self.acg_gate = _MLPDeltaGate()
-            else:
-                self.acg_gate = None
-        else:
-            self.acg_gate = None
+        # Important: adaptive gate module is constructed AFTER backbone /
+        # quality_head / frame_head / video_head, so that its RNG consumption
+        # does NOT shift the initialization of any main-path module.
+        # This guarantees that gate=none and gate=mlp_delta (eps=0) produce
+        # byte-identical backbone/classifier weights.
+        self.acg_gate = None  # placeholder; actual gate is built below
 
         # Debug tensors (populated per forward)
         self.last_segment_weights = None
@@ -632,6 +623,23 @@ class VideoClassifier(nn.Module):
         self.quality_head = SegmentQualityMLP(in_features=self.feature_dim)
         self.frame_head = create_qmil_frame_head(self.feature_dim, num_classes)
         self.video_head = nn.Sequential(nn.Dropout(float(video_dropout)), nn.Linear(self.feature_dim, num_classes))
+
+        # ---- Build adaptive gate module ----
+        # IMPORTANT: gate must be created AFTER all main-path modules so that
+        # its RNG consumption does NOT shift backbone / quality_head /
+        # frame_head / video_head initialization.  This guarantees that
+        #   gate=none (fixed STG)  and  gate=mlp_delta (eps=0)
+        # produce identical backbone weights.
+        if self.selection_mode == "stg_crsa_residual" and self.stg_adaptive_gate != "none":
+            if self.stg_adaptive_gate == "stats3":
+                self.acg_gate = _Stats3Gate(init_bias=self.stg_gate_init_bias)
+            elif self.stg_adaptive_gate == "mlp":
+                self.acg_gate = _MLPGate(init_bias=self.stg_gate_init_bias)
+            elif self.stg_adaptive_gate == "stats3_delta":
+                self.acg_gate = _Stats3DeltaGate()
+            elif self.stg_adaptive_gate == "mlp_delta":
+                self.acg_gate = _MLPDeltaGate()
+            # else acg_gate stays None
 
     # ----------------------------------------------------------------
     #  ACG-STG: Gate statistics computation
@@ -781,48 +789,58 @@ class VideoClassifier(nn.Module):
                 uniform_w = torch.full((B, S), 1.0 / S, device=stg_raw_w.device, dtype=stg_raw_w.dtype)
 
                 if self.acg_gate is not None:
-                    # ---- ACG-STG: adaptive video-level gate ----
-                    stats_dict = self._compute_gate_statistics(seg_probs, support, stg_raw_w)
-
-                    # Build input tensor in canonical order
-                    if self.stg_adaptive_gate in ("stats3", "stats3_delta"):
-                        stats_keys = ["seg_prob_std", "neighbor_smoothness", "support_mean"]
-                    else:  # mlp or mlp_delta
-                        stats_keys = [
-                            "seg_prob_std", "top1_minus_mean", "prob_range",
-                            "neighbor_smoothness", "support_mean", "support_top1",
-                            "entropy_or_concentration",
-                        ]
-                    stats_tensor = torch.stack([stats_dict[k] for k in stats_keys], dim=1)  # [B, n_stats]
-
-                    if self.stg_gate_detach_stats:
-                        stats_tensor = stats_tensor.detach()
-
-                    raw_out = self.acg_gate(stats_tensor)  # [B, 1]
-
-                    if self.stg_adaptive_gate in ("mlp_delta", "stats3_delta"):
-                        # ---- Delta mode: residual-to-fixed ----
-                        delta = torch.tanh(raw_out)  # [B, 1] in (-1, 1)
-                        lambda_eff = self.stg_delta_base_lambda + self.stg_delta_eps * delta
-                        lambda_eff = torch.clamp(lambda_eff, self.stg_delta_min, self.stg_delta_max)
-                        g = delta  # for storage/logging, g = delta
-                    else:
-                        # ---- v1: sigmoid gate mode ----
-                        g = torch.sigmoid(raw_out)  # [B, 1] in (0,1)
-                        lambda_eff = self.stg_residual_lambda * g  # [B, 1]
-
-                    seg_w = (1.0 - lambda_eff) * uniform_w + lambda_eff * stg_raw_w
-                    seg_w = seg_w / (seg_w.sum(dim=1, keepdim=True) + 1e-8)
-
-                    # Store gate stats
-                    self.last_gate_raw = g
-                    if self.stg_gate_log:
-                        self.last_gate_stats = {
-                            "gate": g.detach(),
-                            "lambda_eff": lambda_eff.detach(),
-                        }
-                    else:
+                    # ---- eps=0 delta mode: strictly equivalent to fixed STG ----
+                    # Bypass ALL gate computation (stats, MLP forward, tanh) to guarantee
+                    # numerical equivalence with the fixed-lambda path below.
+                    if self.stg_adaptive_gate in ("mlp_delta", "stats3_delta") and self.stg_delta_eps == 0.0:
+                        lam = self.stg_delta_base_lambda  # scalar, same as fixed STG
+                        seg_w = (1.0 - lam) * uniform_w + lam * stg_raw_w
+                        seg_w = seg_w / (seg_w.sum(dim=1, keepdim=True) + 1e-8)
                         self.last_gate_stats = None
+                        self.last_gate_raw = None
+                    else:
+                        # ---- ACG-STG: adaptive video-level gate ----
+                        stats_dict = self._compute_gate_statistics(seg_probs, support, stg_raw_w)
+
+                        # Build input tensor in canonical order
+                        if self.stg_adaptive_gate in ("stats3", "stats3_delta"):
+                            stats_keys = ["seg_prob_std", "neighbor_smoothness", "support_mean"]
+                        else:  # mlp or mlp_delta
+                            stats_keys = [
+                                "seg_prob_std", "top1_minus_mean", "prob_range",
+                                "neighbor_smoothness", "support_mean", "support_top1",
+                                "entropy_or_concentration",
+                            ]
+                        stats_tensor = torch.stack([stats_dict[k] for k in stats_keys], dim=1)  # [B, n_stats]
+
+                        if self.stg_gate_detach_stats:
+                            stats_tensor = stats_tensor.detach()
+
+                        raw_out = self.acg_gate(stats_tensor)  # [B, 1]
+
+                        if self.stg_adaptive_gate in ("mlp_delta", "stats3_delta"):
+                            # ---- Delta mode: residual-to-fixed (eps > 0) ----
+                            delta = torch.tanh(raw_out)  # [B, 1] in (-1, 1)
+                            lambda_eff = self.stg_delta_base_lambda + self.stg_delta_eps * delta
+                            lambda_eff = torch.clamp(lambda_eff, self.stg_delta_min, self.stg_delta_max)
+                            g = delta  # for storage/logging, g = delta
+                        else:
+                            # ---- v1: sigmoid gate mode ----
+                            g = torch.sigmoid(raw_out)  # [B, 1] in (0,1)
+                            lambda_eff = self.stg_residual_lambda * g  # [B, 1]
+
+                        seg_w = (1.0 - lambda_eff) * uniform_w + lambda_eff * stg_raw_w
+                        seg_w = seg_w / (seg_w.sum(dim=1, keepdim=True) + 1e-8)
+
+                        # Store gate stats
+                        self.last_gate_raw = g
+                        if self.stg_gate_log:
+                            self.last_gate_stats = {
+                                "gate": g.detach(),
+                                "lambda_eff": lambda_eff.detach(),
+                            }
+                        else:
+                            self.last_gate_stats = None
                 else:
                     # Original fixed-lambda path (unchanged)
                     lam = self.stg_residual_lambda
