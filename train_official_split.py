@@ -147,13 +147,19 @@ STG_RESIDUAL_LAMBDA = float(os.environ.get("STG_RESIDUAL_LAMBDA", "0.25"))
 
 # ---- ACG-STG: Adaptive Gate hyperparameters ----
 STG_ADAPTIVE_GATE = os.environ.get("STG_ADAPTIVE_GATE", "none").strip().lower()
-assert STG_ADAPTIVE_GATE in ("none", "stats3", "mlp"), \
-    f"STG_ADAPTIVE_GATE must be 'none', 'stats3', or 'mlp', got '{STG_ADAPTIVE_GATE}'"
+assert STG_ADAPTIVE_GATE in ("none", "stats3", "mlp", "mlp_delta", "stats3_delta"), \
+    f"STG_ADAPTIVE_GATE must be 'none', 'stats3', 'mlp', 'mlp_delta', or 'stats3_delta', got '{STG_ADAPTIVE_GATE}'"
 STG_GATE_DETACH_STATS = os.environ.get("STG_GATE_DETACH_STATS", "1").lower() not in ("0", "false", "no")
 STG_GATE_BUDGET_WEIGHT = float(os.environ.get("STG_GATE_BUDGET_WEIGHT", "0.0"))
 STG_GATE_BUDGET_RHO = float(os.environ.get("STG_GATE_BUDGET_RHO", "0.7"))
 STG_GATE_INIT_BIAS = float(os.environ.get("STG_GATE_INIT_BIAS", "0.0"))
 STG_GATE_LOG = os.environ.get("STG_GATE_LOG", "1").lower() not in ("0", "false", "no")
+
+# ---- ACG-STG Delta: Residual-to-fixed hyperparameters ----
+STG_DELTA_BASE_LAMBDA = float(os.environ.get("STG_DELTA_BASE_LAMBDA", "0.15"))
+STG_DELTA_EPS = float(os.environ.get("STG_DELTA_EPS", "0.05"))
+STG_DELTA_MIN = float(os.environ.get("STG_DELTA_MIN", "0.0"))
+STG_DELTA_MAX = float(os.environ.get("STG_DELTA_MAX", "1.0"))
 
 # Derived flag: any STG-CRSA mode
 _STG_CRSA_ACTIVE = SELECTION_MODE.startswith("stg_crsa")
@@ -162,6 +168,12 @@ _STG_CRSA_ACTIVE = SELECTION_MODE.startswith("stg_crsa")
 _ACG_STG_ACTIVE = (
     SELECTION_MODE == "stg_crsa_residual"
     and STG_ADAPTIVE_GATE != "none"
+)
+
+# Derived flag: ACG-STG Delta mode active
+_ACG_STG_DELTA_ACTIVE = (
+    SELECTION_MODE == "stg_crsa_residual"
+    and STG_ADAPTIVE_GATE in ("mlp_delta", "stats3_delta")
 )
 
 # ---- Ranking Loss hyperparameters ----
@@ -349,6 +361,10 @@ def create_model():
         stg_gate_detach_stats=STG_GATE_DETACH_STATS,
         stg_gate_init_bias=STG_GATE_INIT_BIAS,
         stg_gate_log=STG_GATE_LOG,
+        stg_delta_base_lambda=STG_DELTA_BASE_LAMBDA,
+        stg_delta_eps=STG_DELTA_EPS,
+        stg_delta_min=STG_DELTA_MIN,
+        stg_delta_max=STG_DELTA_MAX,
     )
     total_params, trainable_params = _count_params(model)
     print(
@@ -431,6 +447,10 @@ def create_model():
                         "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
                         "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
                         "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+                        "stg_delta_base_lambda": STG_DELTA_BASE_LAMBDA if _ACG_STG_DELTA_ACTIVE else None,
+                        "stg_delta_eps": STG_DELTA_EPS if _ACG_STG_DELTA_ACTIVE else None,
+                        "stg_delta_min": STG_DELTA_MIN if _ACG_STG_DELTA_ACTIVE else None,
+                        "stg_delta_max": STG_DELTA_MAX if _ACG_STG_DELTA_ACTIVE else None,
                         "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
                         "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
                         "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
@@ -531,6 +551,10 @@ def create_model():
         "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+        "stg_delta_base_lambda": STG_DELTA_BASE_LAMBDA if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_eps": STG_DELTA_EPS if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_min": STG_DELTA_MIN if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_max": STG_DELTA_MAX if _ACG_STG_DELTA_ACTIVE else None,
         "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
         "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
         "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
@@ -609,6 +633,11 @@ def main():
         print(f"STG_GATE_BUDGET_WEIGHT:       {STG_GATE_BUDGET_WEIGHT}")
         print(f"STG_GATE_BUDGET_RHO:          {STG_GATE_BUDGET_RHO}")
         print(f"STG_GATE_LOG:                 {STG_GATE_LOG}")
+    if _ACG_STG_DELTA_ACTIVE:
+        print(f"STG_DELTA_BASE_LAMBDA:        {STG_DELTA_BASE_LAMBDA}")
+        print(f"STG_DELTA_EPS:                {STG_DELTA_EPS}")
+        print(f"STG_DELTA_MIN:                {STG_DELTA_MIN}")
+        print(f"STG_DELTA_MAX:                {STG_DELTA_MAX}")
     if _RANK_LOSS_ACTIVE:
         print(f"RANK_LOSS_WEIGHT:             {RANK_LOSS_WEIGHT}")
         print(f"RANK_LOSS_TAU:                {RANK_LOSS_TAU}")
@@ -881,14 +910,24 @@ def main():
             if _ACG_STG_ACTIVE and len(epoch_gate_vals) > 0:
                 all_gates = torch.cat(epoch_gate_vals)       # [total_B]
                 all_lambdas = torch.cat(epoch_lambda_vals)   # [total_B]
-                gate_log_entry = {
-                    "gate_mean": float(all_gates.mean().item()),
-                    "gate_std": float(all_gates.std().item()),
-                    "gate_min": float(all_gates.min().item()),
-                    "gate_max": float(all_gates.max().item()),
-                    "lambda_eff_mean": float(all_lambdas.mean().item()),
-                    "lambda_eff_std": float(all_lambdas.std().item()),
-                }
+                if _ACG_STG_DELTA_ACTIVE:
+                    gate_log_entry = {
+                        "delta_mean": float(all_gates.mean().item()),
+                        "delta_std": float(all_gates.std().item()),
+                        "delta_min": float(all_gates.min().item()),
+                        "delta_max": float(all_gates.max().item()),
+                        "lambda_eff_mean": float(all_lambdas.mean().item()),
+                        "lambda_eff_std": float(all_lambdas.std().item()),
+                    }
+                else:
+                    gate_log_entry = {
+                        "gate_mean": float(all_gates.mean().item()),
+                        "gate_std": float(all_gates.std().item()),
+                        "gate_min": float(all_gates.min().item()),
+                        "gate_max": float(all_gates.max().item()),
+                        "lambda_eff_mean": float(all_lambdas.mean().item()),
+                        "lambda_eff_std": float(all_lambdas.std().item()),
+                    }
                 if STG_GATE_BUDGET_WEIGHT > 0 and len(epoch_budget_vals) > 0:
                     gate_log_entry["budget_loss_mean"] = float(
                         sum(epoch_budget_vals) / max(1, len(epoch_budget_vals))
@@ -927,18 +966,32 @@ def main():
                 f"Train loss={train_loss:.4f}, acc={train_acc:.3f}"
             )
             if gate_log_entry is not None:
-                _log(
-                    f"[ACG-STG] gate_mean={gate_log_entry['gate_mean']:.4f} "
-                    f"gate_std={gate_log_entry['gate_std']:.4f} "
-                    f"gate_min={gate_log_entry['gate_min']:.4f} "
-                    f"gate_max={gate_log_entry['gate_max']:.4f} "
-                    f"lambda_eff_mean={gate_log_entry['lambda_eff_mean']:.4f} "
-                    f"lambda_eff_std={gate_log_entry['lambda_eff_std']:.4f}"
-                    + (
-                        f" budget_loss={gate_log_entry.get('budget_loss_mean', 0.0):.6f}"
-                        if STG_GATE_BUDGET_WEIGHT > 0 else ""
+                if _ACG_STG_DELTA_ACTIVE:
+                    _log(
+                        f"[ACG-STG-DELTA] delta_mean={gate_log_entry['delta_mean']:.4f} "
+                        f"delta_std={gate_log_entry['delta_std']:.4f} "
+                        f"delta_min={gate_log_entry['delta_min']:.4f} "
+                        f"delta_max={gate_log_entry['delta_max']:.4f} "
+                        f"lambda_eff_mean={gate_log_entry['lambda_eff_mean']:.4f} "
+                        f"lambda_eff_std={gate_log_entry['lambda_eff_std']:.4f}"
+                        + (
+                            f" budget_loss={gate_log_entry.get('budget_loss_mean', 0.0):.6f}"
+                            if STG_GATE_BUDGET_WEIGHT > 0 else ""
+                        )
                     )
-                )
+                else:
+                    _log(
+                        f"[ACG-STG] gate_mean={gate_log_entry['gate_mean']:.4f} "
+                        f"gate_std={gate_log_entry['gate_std']:.4f} "
+                        f"gate_min={gate_log_entry['gate_min']:.4f} "
+                        f"gate_max={gate_log_entry['gate_max']:.4f} "
+                        f"lambda_eff_mean={gate_log_entry['lambda_eff_mean']:.4f} "
+                        f"lambda_eff_std={gate_log_entry['lambda_eff_std']:.4f}"
+                        + (
+                            f" budget_loss={gate_log_entry.get('budget_loss_mean', 0.0):.6f}"
+                            if STG_GATE_BUDGET_WEIGHT > 0 else ""
+                        )
+                    )
             if rank_log_entry is not None:
                 _log(
                     f"[RankLoss] weight_eff={rank_log_entry['rank_weight_eff']:.4f} "
@@ -1088,6 +1141,10 @@ def main():
             "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
             "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
             "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+            "stg_delta_base_lambda": STG_DELTA_BASE_LAMBDA if _ACG_STG_DELTA_ACTIVE else None,
+            "stg_delta_eps": STG_DELTA_EPS if _ACG_STG_DELTA_ACTIVE else None,
+            "stg_delta_min": STG_DELTA_MIN if _ACG_STG_DELTA_ACTIVE else None,
+            "stg_delta_max": STG_DELTA_MAX if _ACG_STG_DELTA_ACTIVE else None,
             "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
             "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
             "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
@@ -1146,6 +1203,10 @@ def main():
         "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
+        "stg_delta_base_lambda": STG_DELTA_BASE_LAMBDA if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_eps": STG_DELTA_EPS if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_min": STG_DELTA_MIN if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_max": STG_DELTA_MAX if _ACG_STG_DELTA_ACTIVE else None,
         "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
         "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
         "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
@@ -1191,6 +1252,10 @@ def main():
         "stg_gate_budget_weight": STG_GATE_BUDGET_WEIGHT if _ACG_STG_ACTIVE else None,
         "stg_gate_budget_rho": STG_GATE_BUDGET_RHO if _ACG_STG_ACTIVE else None,
         "stg_gate_init_bias": STG_GATE_INIT_BIAS if _ACG_STG_ACTIVE else None,
+        "stg_delta_base_lambda": STG_DELTA_BASE_LAMBDA if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_eps": STG_DELTA_EPS if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_min": STG_DELTA_MIN if _ACG_STG_DELTA_ACTIVE else None,
+        "stg_delta_max": STG_DELTA_MAX if _ACG_STG_DELTA_ACTIVE else None,
         "rank_loss_weight": RANK_LOSS_WEIGHT if _RANK_LOSS_ACTIVE else None,
         "rank_loss_tau": RANK_LOSS_TAU if _RANK_LOSS_ACTIVE else None,
         "rank_loss_margin": RANK_LOSS_MARGIN if _RANK_LOSS_ACTIVE else None,
@@ -1265,6 +1330,7 @@ def main():
             "CRSA_ALPHA", "CRSA_CENTER", "STG_RESIDUAL_LAMBDA",
             "STG_ADAPTIVE_GATE", "STG_GATE_DETACH_STATS", "STG_GATE_BUDGET_WEIGHT",
             "STG_GATE_BUDGET_RHO", "STG_GATE_INIT_BIAS", "STG_GATE_LOG",
+            "STG_DELTA_BASE_LAMBDA", "STG_DELTA_EPS", "STG_DELTA_MIN", "STG_DELTA_MAX",
             "RANK_LOSS_WEIGHT", "RANK_LOSS_TAU", "RANK_LOSS_MARGIN",
             "RANK_LOSS_WARMUP_EPOCHS", "RANK_LOSS_USE_PROB",
         ]
