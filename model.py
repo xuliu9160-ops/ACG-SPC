@@ -578,12 +578,13 @@ class VideoClassifier(nn.Module):
         self.stg_delta_min = float(stg_delta_min)
         self.stg_delta_max = float(stg_delta_max)
 
-        # Important: adaptive gate module is constructed AFTER backbone /
-        # quality_head / frame_head / video_head, so that its RNG consumption
-        # does NOT shift the initialization of any main-path module.
+        # Adaptive gate module is constructed AFTER all main-path modules
+        # AND within a CPU/CUDA RNG save/restore guard, so that its internal
+        # nn.Linear Kaiming init does NOT leak RNG state to the caller.
         # This guarantees that gate=none and gate=mlp_delta (eps=0) produce
-        # byte-identical backbone/classifier weights.
-        self.acg_gate = None  # placeholder; actual gate is built below
+        # identical global RNG after __init__, ensuring identical DataLoader
+        # shuffle, augmentation, and dropout sequences.
+        self.acg_gate = None  # placeholder; actual gate is built below (RNG-isolated)
 
         # Debug tensors (populated per forward)
         self.last_segment_weights = None
@@ -625,11 +626,17 @@ class VideoClassifier(nn.Module):
         self.video_head = nn.Sequential(nn.Dropout(float(video_dropout)), nn.Linear(self.feature_dim, num_classes))
 
         # ---- Build adaptive gate module ----
-        # IMPORTANT: gate must be created AFTER all main-path modules so that
-        # its RNG consumption does NOT shift backbone / quality_head /
-        # frame_head / video_head initialization.  This guarantees that
-        #   gate=none (fixed STG)  and  gate=mlp_delta (eps=0)
-        # produce identical backbone weights.
+        # CRITICAL: gate creation must NOT leak RNG state, or it will shift
+        # the entire downstream training random sequence (DataLoader shuffle,
+        # augmentation transforms, dropout masks, stochastic depth, etc.).
+        # We save/restore both CPU and CUDA RNG states so that constructing a
+        # model with gate=mlp_delta produces the *exact same* global RNG state
+        # as gate=none.  The gate itself uses the current RNG (inherits the
+        # state that would have been consumed by hypothetical future ops),
+        # which is fine — only the *global* state after __init__ must match.
+        _cpu_rng = torch.get_rng_state()
+        _cuda_rngs = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
         if self.selection_mode == "stg_crsa_residual" and self.stg_adaptive_gate != "none":
             if self.stg_adaptive_gate == "stats3":
                 self.acg_gate = _Stats3Gate(init_bias=self.stg_gate_init_bias)
@@ -640,6 +647,10 @@ class VideoClassifier(nn.Module):
             elif self.stg_adaptive_gate == "mlp_delta":
                 self.acg_gate = _MLPDeltaGate()
             # else acg_gate stays None
+
+        torch.set_rng_state(_cpu_rng)
+        if _cuda_rngs is not None:
+            torch.cuda.set_rng_state_all(_cuda_rngs)
 
     # ----------------------------------------------------------------
     #  ACG-STG: Gate statistics computation
