@@ -599,6 +599,12 @@ class VideoClassifier(nn.Module):
         self.last_gate_stats = None   # dict: gate, lambda_eff (detached, for logging)
         self.last_gate_raw = None     # [B,1] tensor (non-detached, for budget loss)
 
+        # ACG-SPC: segment weight/feature cache for second aggregation path.
+        # Only populated when enable_acg_spc_cache is set by the training loop.
+        self.enable_acg_spc_cache = False
+        self.last_seg_w_for_spc = None      # [B, S] non-detached
+        self.last_seg_tokens_for_spc = None  # [B, S, D]
+
         backbone = create_qmil_backbone(
             backbone_source=backbone_source,
             timm_name=timm_name,
@@ -877,10 +883,41 @@ class VideoClassifier(nn.Module):
 
         self.last_segment_weights = seg_w.detach()
 
+        # ACG-SPC: conditionally cache non-detached tensors for second aggregation.
+        # When disabled (default), both stay None — no compute-graph retention.
+        if getattr(self, "enable_acg_spc_cache", False):
+            self.last_seg_w_for_spc = seg_w          # [B, S] non-detached
+            self.last_seg_tokens_for_spc = seg_tokens  # [B, S, D]
+        else:
+            self.last_seg_w_for_spc = None
+            self.last_seg_tokens_for_spc = None
+
         video_feat = (seg_tokens * seg_w.unsqueeze(-1)).sum(dim=1)  # [B,D]
         video_logits = self.video_head(video_feat)
 
         return frame_logits, video_logits
+
+    # ----------------------------------------------------------------
+    #  ACG-SPC: Weighted aggregation helper
+    # ----------------------------------------------------------------
+    def aggregate_with_weights(self, seg_tokens, seg_w, linear_only=False):
+        """Reusable segment→video aggregation: tokens + weights → logits.
+
+        Args:
+            seg_tokens:  [B, S, D] segment features.
+            seg_w:       [B, S] aggregation weights (renormalized internally).
+            linear_only: if True, use video_head[-1] (Linear only, no dropout)
+                         to avoid RNG consumption on the side path.
+
+        Returns:
+            video_logits: [B, num_classes]
+        """
+        seg_w = seg_w / (seg_w.sum(dim=1, keepdim=True) + 1e-8)
+        video_feat = (seg_tokens * seg_w.unsqueeze(-1)).sum(dim=1)  # [B, D]
+        if linear_only:
+            return self.video_head[-1](video_feat)   # no dropout, no RNG
+        else:
+            return self.video_head(video_feat)
 
 
 if __name__ == "__main__":

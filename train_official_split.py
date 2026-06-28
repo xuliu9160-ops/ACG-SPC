@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import BUVFolderDataset
-from loss import combined_loss, pairwise_ranking_loss
+from loss import combined_loss, pairwise_ranking_loss, acg_spc_low_loss
 from model import VideoClassifier, load_mae_encoder_from_checkpoint
 
 
@@ -185,6 +185,12 @@ RANK_LOSS_USE_PROB = os.environ.get("RANK_LOSS_USE_PROB", "0").lower() not in ("
 
 # Derived flag: ranking loss active
 _RANK_LOSS_ACTIVE = RANK_LOSS_WEIGHT > 0.0
+
+# ---- ACG-SPC: Segment Perturbation Consistency (low-drop only) ----
+ACG_SPC_ENABLE = os.environ.get("ACG_SPC_ENABLE", "0").lower() not in ("0", "false", "no")
+ACG_SPC_LOW_K = int(os.environ.get("ACG_SPC_LOW_K", "1"))
+ACG_SPC_LOW_WEIGHT = float(os.environ.get("ACG_SPC_LOW_WEIGHT", "0.02"))
+ACG_SPC_WARMUP_EPOCHS = int(os.environ.get("ACG_SPC_WARMUP_EPOCHS", "5"))
 
 
 # ==========================================================
@@ -772,6 +778,8 @@ def main():
         class_weights_video = torch.tensor(w, dtype=torch.float32, device=DEVICE)
 
         model = create_model()
+        # ACG-SPC: enable non-detached seg_w/seg_tokens caching only when active
+        _get_base_model(model).enable_acg_spc_cache = ACG_SPC_ENABLE
         optimizer = create_optimizer(model)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=ETA_MIN)
         scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
@@ -796,6 +804,9 @@ def main():
             epoch_lambda_vals = []    # accumulated lambda_eff values for logging
             epoch_budget_vals = []    # accumulated budget loss values
             epoch_rank_vals = []      # accumulated ranking loss values
+            epoch_spc_kl_vals = []    # accumulated spc_low_kl
+            epoch_spc_delta_vals = []  # accumulated drop_low_delta_prob
+            epoch_spc_bkw_vals = []   # accumulated bottomk_weight_mean
 
             # ---- Ranking loss warmup ----
             if _RANK_LOSS_ACTIVE:
@@ -804,6 +815,14 @@ def main():
                     rank_weight_eff = RANK_LOSS_WEIGHT * float(epoch) / float(max(1, RANK_LOSS_WARMUP_EPOCHS))
             else:
                 rank_weight_eff = 0.0
+
+            # ---- ACG-SPC warmup ----
+            if ACG_SPC_ENABLE:
+                spc_weight_eff = ACG_SPC_LOW_WEIGHT
+                if epoch <= ACG_SPC_WARMUP_EPOCHS:
+                    spc_weight_eff = ACG_SPC_LOW_WEIGHT * float(epoch) / float(max(1, ACG_SPC_WARMUP_EPOCHS))
+            else:
+                spc_weight_eff = 0.0
 
             pbar = tqdm(train_loader, desc=f"Repeat {repeat_idx} Epoch {epoch}/{EPOCHS}", leave=False)
             for videos, labels in pbar:
@@ -863,6 +882,24 @@ def main():
                                 epoch_gate_vals.append(gate_stats["gate"].detach().cpu())
                                 epoch_lambda_vals.append(gate_stats["lambda_eff"].detach().cpu())
 
+                    # ---- ACG-SPC: low-drop perturbation consistency ----
+                    spc_val = loss.new_tensor(0.0)
+                    spc_debug = {"spc_low_kl": 0.0, "drop_low_delta_prob": 0.0,
+                                 "bottomk_weight_mean": 0.0}
+                    if ACG_SPC_ENABLE and spc_weight_eff > 0.0:
+                        base_model_spc = _get_base_model(model)
+                        seg_w_spc = getattr(base_model_spc, "last_seg_w_for_spc", None)
+                        seg_tok = getattr(base_model_spc, "last_seg_tokens_for_spc", None)
+                        if seg_w_spc is not None and seg_tok is not None:
+                            spc_val, spc_debug = acg_spc_low_loss(
+                                seg_w_spc, seg_tok, base_model_spc,
+                                low_k=ACG_SPC_LOW_K,
+                            )
+                            loss = loss + spc_weight_eff * spc_val
+                            # Clear cache immediately after use
+                            base_model_spc.last_seg_w_for_spc = None
+                            base_model_spc.last_seg_tokens_for_spc = None
+
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_NORM)
@@ -873,6 +910,11 @@ def main():
                 preds = video_logits.argmax(dim=1)
                 running_correct += (preds == labels).sum().item()
                 running_total += labels.size(0)
+
+                if ACG_SPC_ENABLE and spc_weight_eff > 0.0:
+                    epoch_spc_kl_vals.append(spc_debug["spc_low_kl"])
+                    epoch_spc_delta_vals.append(spc_debug["drop_low_delta_prob"])
+                    epoch_spc_bkw_vals.append(spc_debug["bottomk_weight_mean"])
 
                 pbar.set_postfix(
                     loss=float(loss.item()),
@@ -942,6 +984,16 @@ def main():
                     "rank_weight_eff": float(rank_weight_eff),
                 }
 
+            # ---- ACG-SPC: epoch summary ----
+            spc_log_entry = None
+            if ACG_SPC_ENABLE and len(epoch_spc_kl_vals) > 0:
+                spc_log_entry = {
+                    "spc_low_kl": float(sum(epoch_spc_kl_vals) / max(1, len(epoch_spc_kl_vals))),
+                    "drop_low_delta_prob": float(sum(epoch_spc_delta_vals) / max(1, len(epoch_spc_delta_vals))),
+                    "bottomk_weight_mean": float(sum(epoch_spc_bkw_vals) / max(1, len(epoch_spc_bkw_vals))),
+                    "spc_weight_eff": float(spc_weight_eff),
+                }
+
             _hist_entry = {
                     "epoch": int(epoch),
                     "train_loss": float(train_loss),
@@ -958,6 +1010,8 @@ def main():
                 _hist_entry["acg_stg_gate"] = gate_log_entry
             if rank_log_entry is not None:
                 _hist_entry["rank_loss"] = rank_log_entry
+            if spc_log_entry is not None:
+                _hist_entry["acg_spc"] = spc_log_entry
             history.append(_hist_entry)
 
             print("\n" + "-" * 100)
@@ -996,6 +1050,13 @@ def main():
                 _log(
                     f"[RankLoss] weight_eff={rank_log_entry['rank_weight_eff']:.4f} "
                     f"rank_loss={rank_log_entry['rank_loss']:.6f}"
+                )
+            if spc_log_entry is not None:
+                _log(
+                    f"[ACG-SPC] spc_low_kl={spc_log_entry['spc_low_kl']:.4f} "
+                    f"delta_prob={spc_log_entry['drop_low_delta_prob']:.4f} "
+                    f"bkw_mean={spc_log_entry['bottomk_weight_mean']:.4f} "
+                    f"spc_w={spc_log_entry['spc_weight_eff']:.4f}"
                 )
             print(
                 f"Internal Val | AUC={iv_auc:.4f}, AUPRC={iv_auprc:.4f}, "

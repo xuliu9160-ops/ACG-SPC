@@ -141,3 +141,84 @@ def combined_loss(
     total_loss = frame_weight * frame_loss_avg + video_loss
 
     return total_loss, frame_loss_avg.detach(), video_loss.detach()
+
+
+# ================================================================
+#  ACG-SPC: Segment Perturbation Consistency (low-drop only)
+# ================================================================
+
+def mask_bottom_k_weights(seg_w: torch.Tensor, k: int):
+    """Zero out the bottom-k weights and renormalize.
+
+    Args:
+        seg_w: [B, S] L1-normalized aggregation weights.
+        k:     number of lowest-weight segments to drop.
+
+    Returns:
+        masked_w: [B, S] renormalized weights (sum=1 per sample).
+        bottom_idx: [B, k] indices of dropped segments (for diagnostics).
+    """
+    B, S = seg_w.shape
+    k_eff = min(int(k), S - 1)  # keep at least 1 segment
+    if k_eff <= 0:
+        return seg_w, None
+
+    _, bottom_idx = seg_w.topk(k_eff, dim=1, largest=False)  # [B, k]
+    mask = torch.ones_like(seg_w)
+    mask.scatter_(1, bottom_idx, 0.0)
+    masked_w = seg_w * mask
+    masked_w = masked_w / (masked_w.sum(dim=1, keepdim=True) + 1e-8)
+    return masked_w, bottom_idx
+
+
+def acg_spc_low_loss(
+    seg_w: torch.Tensor,
+    seg_tokens: torch.Tensor,
+    model,
+    low_k: int = 1,
+):
+    """ACG-SPC low-drop consistency loss.
+
+    Both teacher and student use no-dropout (linear_only=True) aggregation
+    to avoid dropout RNG consumption.  Teacher logits are fully detached.
+
+    Args:
+        seg_w:      [B, S] non-detached ACG aggregation weights.
+        seg_tokens: [B, S, D] segment features.
+        model:      VideoClassifier (must have aggregate_with_weights).
+        low_k:      number of lowest-weight segments to drop.
+
+    Returns:
+        (loss, debug_dict)
+    """
+    # Mask: drop bottom-k weights, renormalize (weights detached)
+    masked_w, bottom_idx = mask_bottom_k_weights(seg_w.detach(), low_k)
+
+    # Teacher: no-dropout full aggregation, fully detached
+    teacher_logits = model.aggregate_with_weights(
+        seg_tokens, seg_w.detach(), linear_only=True
+    ).detach()
+
+    # Student: no-dropout low-drop aggregation (grad flows through seg_tokens)
+    student_logits = model.aggregate_with_weights(
+        seg_tokens, masked_w, linear_only=True
+    )
+
+    # KL divergence: stopgrad(teacher) || student
+    teacher_prob = torch.softmax(teacher_logits, dim=-1)
+    student_log_prob = torch.log_softmax(student_logits, dim=-1)
+    kl = torch.sum(teacher_prob * (torch.log(teacher_prob + 1e-8) - student_log_prob), dim=-1)
+    spc_loss = kl.mean()
+
+    # Diagnostics
+    teacher_mal = teacher_prob[:, 1]
+    student_mal = torch.softmax(student_logits, dim=-1)[:, 1]
+    delta_prob = (teacher_mal - student_mal).mean().item()
+    bottomk_mean_w = seg_w.gather(1, bottom_idx).mean().item() if bottom_idx is not None else 0.0
+
+    debug = {
+        "spc_low_kl": spc_loss.detach().item(),
+        "drop_low_delta_prob": float(delta_prob),
+        "bottomk_weight_mean": float(bottomk_mean_w),
+    }
+    return spc_loss, debug
